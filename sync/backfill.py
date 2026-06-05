@@ -73,18 +73,42 @@ WATCHLIST: dict[str, tuple[str, str, str]] = {
 # ------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="歷史資料5年回補")
-    parser.add_argument("--years", type=int, default=5,
-                        help="回補年數（預設 5）")
+    parser = argparse.ArgumentParser(description="歷史資料回補")
+    # 指定西元年範圍（優先）
+    parser.add_argument("--year", type=int, default=None,
+                        help="同步指定單一年份，如 --year 2020")
+    parser.add_argument("--from-year", type=int, default=None,
+                        help="同步起始年份，如 --from-year 2015")
+    parser.add_argument("--to-year", type=int, default=None,
+                        help="同步結束年份（含），如 --to-year 2020")
+    # 舊有的「往回幾年」模式（備用）
+    parser.add_argument("--years", type=int, default=None,
+                        help="往回回補幾年（未指定 --year / --from-year 時生效，預設 1）")
     parser.add_argument("--with-chips", action="store_true",
                         help="額外回補三大法人逐日資料（耗時較長）")
     parser.add_argument("--eps-only", action="store_true",
                         help="僅回補 EPS 季報，跳過 OHLCV")
     args = parser.parse_args()
 
-    end_date = date.today()
-    start_date = end_date - timedelta(days=365 * args.years)
-    log.info(f"回補區間：{start_date} ~ {end_date}（{args.years} 年，{len(WATCHLIST)} 檔股票）")
+    today = date.today()
+
+    # 決定 start_date / end_date
+    if args.year:
+        # 單一年份：該年 1/1 ~ 12/31（若為今年則截至今天）
+        start_date = date(args.year, 1, 1)
+        end_date   = date(args.year, 12, 31) if args.year < today.year else today
+    elif args.from_year or args.to_year:
+        from_y = args.from_year or today.year
+        to_y   = args.to_year   or today.year
+        start_date = date(from_y, 1, 1)
+        end_date   = date(to_y, 12, 31) if to_y < today.year else today
+    else:
+        # fallback：往回 N 年（預設 1 年）
+        n = args.years or 1
+        end_date   = today
+        start_date = date(today.year - n, today.month, today.day)
+
+    log.info(f"回補區間：{start_date} ~ {end_date}（{len(WATCHLIST)} 檔股票）")
 
     # Step 1: 確保 stock_info 存在
     _upsert_stock_info()
@@ -103,7 +127,7 @@ def main():
 
     # Step 4: EPS
     log.info("=== STEP 4: 下載 EPS 季報（FinMind）===")
-    _bulk_upsert_eps(args.years)
+    _bulk_upsert_eps(start_date)
 
     log.info("✅ 回補完畢")
 
@@ -266,7 +290,7 @@ def _update_chips_for_date(target_date: date, chips: dict):
 # Step 4: EPS 季報（FinMind API）
 # ------------------------------------------------------------------
 
-def _bulk_upsert_eps(years: int):
+def _bulk_upsert_eps(start_date: date):
     """
     從 FinMind TaiwanStockFinancialStatements 拉取 EPS，寫入 stock_eps。
     需在 secrets.toml [finmind] 區塊設定 token。
@@ -278,7 +302,7 @@ def _bulk_upsert_eps(years: int):
         log.warning("請在 .streamlit/secrets.toml 新增：\n[finmind]\ntoken = \"你的token\"")
         return
 
-    start_str = str(date.today() - timedelta(days=365 * years))
+    start_str = str(start_date)
     total_rows = 0
 
     for code, (_, _, _) in WATCHLIST.items():
