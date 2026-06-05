@@ -4,14 +4,23 @@ modules/utils.py — 共用圖表與技術指標工具
 from __future__ import annotations
 
 import pandas as pd
-import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
 # ------------------------------------------------------------------
-# 技術指標計算
+# 技術指標計算（純 pandas 實作，不依賴 pandas_ta）
 # ------------------------------------------------------------------
+
+def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(length).mean()
+    loss  = (-delta.clip(upper=0)).rolling(length).mean()
+    # loss=0 時 RSI=100（全漲無跌）
+    rsi = 100 - (100 / (1 + gain / loss))
+    rsi[loss == 0] = 100
+    return rsi
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -24,11 +33,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         "low_price": "low", "close_price": "close", "volume": "volume"
     }, inplace=True)
 
-    df["MA5"]  = ta.sma(df["close"], length=5)
-    df["MA10"] = ta.sma(df["close"], length=10)
-    df["MA20"] = ta.sma(df["close"], length=20)
-    df["MA60"] = ta.sma(df["close"], length=60)
-    df["RSI"]  = ta.rsi(df["close"], length=14)
+    df["MA5"]  = df["close"].rolling(5).mean()
+    df["MA10"] = df["close"].rolling(10).mean()
+    df["MA20"] = df["close"].rolling(20).mean()
+    df["MA60"] = df["close"].rolling(60).mean()
+    df["RSI"]  = _rsi(df["close"], length=14)
 
     return df
 
