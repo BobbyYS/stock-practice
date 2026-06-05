@@ -1,0 +1,70 @@
+name: 每日盤後 ETL 同步
+
+on:
+  # 台北時間 15:45（UTC+8）= UTC 07:45，平日執行
+  schedule:
+    - cron: "45 7 * * 1-5"
+  # 支援手動觸發（可帶入日期補資料）
+  workflow_dispatch:
+    inputs:
+      sync_date:
+        description: "同步日期（YYYY-MM-DD，留空則昨日）"
+        required: false
+        default: ""
+      backfill_days:
+        description: "補歷史天數（0 = 單日）"
+        required: false
+        default: "0"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets.toml from GitHub Secrets
+        run: |
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml << EOF
+          [tidb]
+          host     = "${{ secrets.TIDB_HOST }}"
+          port     = ${{ secrets.TIDB_PORT }}
+          user     = "${{ secrets.TIDB_USER }}"
+          password = "${{ secrets.TIDB_PASSWORD }}"
+          database = "${{ secrets.TIDB_DATABASE }}"
+          ssl_ca   = ""
+
+          [app]
+          user_id  = "etl_bot"
+
+          [finmind]
+          token = "${{ secrets.FINMIND_TOKEN }}"
+          EOF
+
+      - name: Run ETL sync
+        run: |
+          DATE_ARG=""
+          BACKFILL_ARG=""
+          if [ -n "${{ github.event.inputs.sync_date }}" ]; then
+            DATE_ARG="--date ${{ github.event.inputs.sync_date }}"
+          fi
+          if [ "${{ github.event.inputs.backfill_days }}" != "0" ] && [ -n "${{ github.event.inputs.backfill_days }}" ]; then
+            BACKFILL_ARG="--backfill-days ${{ github.event.inputs.backfill_days }}"
+          fi
+          python sync/sync_daily.py $DATE_ARG $BACKFILL_ARG
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f .streamlit/secrets.toml
