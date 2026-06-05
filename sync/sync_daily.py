@@ -238,15 +238,30 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
 def _fetch_chips_tpex(target_date: date) -> dict[str, dict]:
     """
     使用 TPEX JSON API 拉取上櫃股三大法人資料。
+    TPEX 憑證有已知問題（Missing Subject Key Identifier），使用 verify=False。
     """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     roc_year = target_date.year - 1911
     date_str = f"{roc_year}/{target_date.month:02d}/{target_date.day:02d}"
+    import time as _time
+    ts = int(_time.time() * 1000)
     url = (
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_print.php"
-        f"?l=zh-tw&se=AL&t=D&d={date_str}&_=1"
+        f"?l=zh-tw&se=AL&t=D&d={date_str}&_={ts}"
     )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Referer": "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade.php?l=zh-tw",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
     try:
-        resp = requests.get(url, timeout=15, headers={"Referer": "https://www.tpex.org.tw/"})
+        resp = requests.get(url, timeout=15, headers=headers, verify=False)
+        if not resp.text.strip():
+            log.debug(f"TPEX {target_date}：空回應（可能假日或停市）")
+            return {}
         data = resp.json()
     except Exception as e:
         log.warning(f"TPEX 三大法人 API 失敗 ({target_date})：{e}")
