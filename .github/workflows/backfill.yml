@@ -1,0 +1,88 @@
+name: 歷史資料回補 (Backfill)
+
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "同步單一年份（西元年，如 2020）。填此欄則忽略下方 from/to"
+        required: false
+        default: ""
+      from_year:
+        description: "起始年份（如 2015），搭配 to_year 使用"
+        required: false
+        default: ""
+      to_year:
+        description: "結束年份（如 2020），搭配 from_year 使用"
+        required: false
+        default: ""
+      with_chips:
+        description: "回補三大法人資料（true / false，耗時較長）"
+        required: false
+        default: "false"
+      eps_only:
+        description: "僅回補 EPS 季報（true / false）"
+        required: false
+        default: "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets.toml from GitHub Secrets
+        run: |
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml << EOF
+          [tidb]
+          host     = "${{ secrets.TIDB_HOST }}"
+          port     = ${{ secrets.TIDB_PORT }}
+          user     = "${{ secrets.TIDB_USER }}"
+          password = "${{ secrets.TIDB_PASSWORD }}"
+          database = "${{ secrets.TIDB_DATABASE }}"
+          ssl_ca   = ""
+
+          [app]
+          user_id  = "etl_bot"
+
+          [finmind]
+          token = "${{ secrets.FINMIND_TOKEN }}"
+          EOF
+
+      - name: Run backfill
+        run: |
+          ARGS=""
+
+          # 優先：單一年份
+          if [ -n "${{ github.event.inputs.year }}" ]; then
+            ARGS="--year ${{ github.event.inputs.year }}"
+          # 其次：年份範圍
+          elif [ -n "${{ github.event.inputs.from_year }}" ] || [ -n "${{ github.event.inputs.to_year }}" ]; then
+            [ -n "${{ github.event.inputs.from_year }}" ] && ARGS="$ARGS --from-year ${{ github.event.inputs.from_year }}"
+            [ -n "${{ github.event.inputs.to_year }}" ]   && ARGS="$ARGS --to-year ${{ github.event.inputs.to_year }}"
+          else
+            # 都沒填：預設回補近 1 年
+            ARGS="--years 1"
+          fi
+
+          [ "${{ github.event.inputs.with_chips }}" = "true" ] && ARGS="$ARGS --with-chips"
+          [ "${{ github.event.inputs.eps_only }}"  = "true" ]  && ARGS="$ARGS --eps-only"
+
+          echo "執行：python sync/backfill.py $ARGS"
+          python sync/backfill.py $ARGS
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f .streamlit/secrets.toml
