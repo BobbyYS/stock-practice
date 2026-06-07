@@ -180,7 +180,7 @@ def _fetch_twse_historical_ohlcv(stock_no: str, year: int, month: int) -> tuple[
                     })
                 return pd.DataFrame(rows), False
                 
-            elif r.status_code in [403, 429, 503]:
+            elif r.status_code in [307, 403, 429, 503]:
                 log.warning(f"TWSE API 被限流/阻擋：{r.status_code} ({stock_no}, {year}/{month}). Attempt {attempt+1}/{max_retries}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay * (attempt + 1))
@@ -263,7 +263,7 @@ def _fetch_tpex_historical_ohlcv(stock_no: str, year: int, month: int) -> tuple[
                     })
                 return pd.DataFrame(rows), False
                 
-            elif r.status_code in [403, 429, 503]:
+            elif r.status_code in [307, 403, 429, 503]:
                 log.warning(f"TPEX API 被限流/阻擋：{r.status_code} ({stock_no}, {year}/{month}). Attempt {attempt+1}/{max_retries}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay * (attempt + 1))
