@@ -22,8 +22,12 @@ st.set_page_config(
 # ------------------------------------------------------------------
 st.markdown("""
 <style>
-/* 縮小手機端頂部留白 */
-.block-container { padding-top: 1rem !important; }
+/* Streamlit Community Cloud 的固定 header/工具列會蓋住頂部自訂導覽列；
+   本 app 以 option_menu 自行導覽、未使用 sidebar，直接隱藏預設 header。 */
+header[data-testid="stHeader"] { display: none; }
+[data-testid="stToolbar"] { display: none; }
+/* 縮小手機端頂部留白（header 已隱藏，留一點呼吸空間即可） */
+.block-container { padding-top: 1.5rem !important; }
 /* 按鈕全寬 */
 .stButton > button { width: 100%; border-radius: 8px; }
 /* 指標數字加大 */

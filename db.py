@@ -19,9 +19,12 @@ from typing import Any
 def get_engine():
     """從 st.secrets 讀取 TiDB 連線參數，建立 SQLAlchemy engine。"""
     cfg = st.secrets["tidb"]
-    ssl_args: dict = {}
     if cfg.get("ssl_ca"):
-        ssl_args = {"ssl": {"ca": cfg["ssl_ca"]}}
+        # 指定 CA 憑證路徑
+        ssl_args: dict = {"ssl": {"ca": cfg["ssl_ca"]}}
+    else:
+        # TiDB Cloud Serverless 強制 TLS；留空時以系統預設 CA 啟用加密並驗證主機身分
+        ssl_args = {"ssl_verify_identity": True}
 
     conn_url = (
         f"mysql+pymysql://{cfg['user']}:{cfg['password']}"

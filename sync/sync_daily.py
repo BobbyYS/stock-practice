@@ -2,9 +2,10 @@
 sync/sync_daily.py — 每日 ETL 數據同步腳本
 
 功能：
-  1. 從 yfinance 批量拉取台股 OHLCV（支援 .TW / .TWO 後綴）
-  2. 從 TWSE / TPEX 官方 API 拉取三大法人買賣超
-  3. Upsert 至 TiDB Cloud：stock_info + stock_daily_data
+  1. 從 TWSE / TPEX 官方 OpenAPI 拉取當日 OHLCV
+  2. 歷史補資料模式：使用 TWSE STOCK_DAY / TPEX st43 逐股逐月拉取
+  3. 從 TWSE / TPEX 官方 API 拉取三大法人買賣超
+  4. Upsert 至 TiDB Cloud：stock_info + stock_daily_data
 
 使用方式（本地）：
   1. 確保 .streamlit/secrets.toml 已填入 TiDB 連線資訊
@@ -27,7 +28,6 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 # 讓 sync 腳本可以載入 db.py（加入專案根目錄至 sys.path）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -47,18 +47,40 @@ log = logging.getLogger(__name__)
 # 監控清單（請根據實際操盤股池更新）
 # ------------------------------------------------------------------
 
-WATCHLIST: dict[str, tuple[str, str, str]] = {
-    # stock_code  : (yfinance_ticker,  stock_name,    market_type)
-    # 注意：yfinance 對上市和上櫃都使用 .TW 後綴；
-    #       stock_code 保留 .TWO（用於 TPEX 三大法人 API 比對）
-    "2330.TW":  ("2330.TW",  "台積電",  "上市"),
-    "2317.TW":  ("2317.TW",  "鴻海",    "上市"),
-    "2454.TW":  ("2454.TW",  "聯發科",  "上市"),
-    "6449.TWO": ("6449.TW",  "鈺邦",    "上櫃"),   # yfinance ticker 用 .TW
-    "3035.TW":  ("3035.TW",  "智原",    "上市"),
-    "4958.TWO": ("4958.TW",  "臻鼎-KY", "上櫃"),   # yfinance ticker 用 .TW
-    # ↑ 在此新增更多股票（上櫃股 yfinance ticker 請填 .TW，stock_code 填 .TWO）
+WATCHLIST: dict[str, tuple[str, str]] = {
+    # stock_code: (stock_name, market_type)
+    # 上市（.TW）→ TWSE；上櫃（.TWO）→ TPEX
+    "2330.TW":  ("台積電",   "上市"),
+    "2317.TW":  ("鴻海",     "上市"),
+    "2454.TW":  ("聯發科",   "上市"),
+    "6449.TW":  ("鈺邦",     "上市"),   # 已確認上市，非上櫃
+    "3035.TW":  ("智原",     "上市"),
+    "4958.TW":  ("臻鼎-KY",  "上市"),   # 已確認上市，非上櫃
+    # 上櫃股範例：
+    # "8043.TWO": ("宏正", "上櫃"),
 }
+
+
+# ------------------------------------------------------------------
+# API 共用設定：rate limiting 與 headers
+# ------------------------------------------------------------------
+
+API_DELAY = 2.0  # 每次 API 呼叫間隔秒數，避免觸發限流
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def _api_get(url: str, **kwargs) -> requests.Response:
+    """統一 API 呼叫，自動附加 User-Agent 並在呼叫前等待，避免觸發限流。"""
+    time.sleep(API_DELAY)
+    kw: dict = {"timeout": 15, "headers": HEADERS}
+    kw.update(kwargs)
+    return requests.get(url, **kw)
 
 
 # ------------------------------------------------------------------
@@ -72,32 +94,63 @@ def main():
                         help="補歷史資料天數（0 = 僅同步單日）")
     args = parser.parse_args()
 
-    target_date = (
-        date.fromisoformat(args.date) if args.date
-        else date.today() - timedelta(days=1)
-    )
+    target_date = date.fromisoformat(args.date) if args.date else date.today()
 
     if args.backfill_days > 0:
+        # 補歷史：從 target_date 往回 backfill_days 天
         dates = [target_date - timedelta(days=i) for i in range(args.backfill_days - 1, -1, -1)]
-    else:
+    elif args.date:
+        # 指定單一日期
         dates = [target_date]
+    else:
+        # 預設（盤後排程）：同步「今天 + 前一個交易日」
+        # 理由：可能在盤中先跑過一次（當日資料尚未定案），盤後再跑時會一併更正
+        #       前一日，確保今天與昨天的資料都是最新、完整的。
+        dates = []
+        d = target_date
+        while len(dates) < 2:
+            if d.weekday() < 5:
+                dates.append(d)
+            d -= timedelta(days=1)
 
-    # 過濾週末
-    dates = [d for d in dates if d.weekday() < 5]
+    # 過濾週末並去重排序
+    dates = sorted({d for d in dates if d.weekday() < 5})
 
     if not dates:
         log.info("沒有需要同步的交易日（可能都是週末）。")
         return
 
-    log.info(f"準備同步 {len(dates)} 個交易日，共 {len(WATCHLIST)} 檔股票")
+    log.info(f"準備同步 {len(dates)} 個交易日 {dates[0]}~{dates[-1]}，共 {len(WATCHLIST)} 檔股票")
 
     # Step 1: 確保所有股票已在 stock_info
     _upsert_stock_info()
 
-    # Step 2: 批量拉取 yfinance OHLCV
-    start_str = str(min(dates))
-    end_str = str(max(dates) + timedelta(days=1))
-    ohlcv_map = _fetch_ohlcv_batch(start_str, end_str)
+    # Step 2: 拉取 OHLCV
+    #   - 純歷史補資料（backfill 或指定較舊日期）→ 只用歷史 API
+    #   - 一般每日同步 → 先用歷史 API 取得日期區間內已公布資料（含前一交易日），
+    #     再用 OpenAPI 覆蓋「最新交易日」。OpenAPI 只會回最新一日，盤後跑 = 今天，
+    #     盤中跑 = 前一交易日；兩種情況都能確保抓到最新可得的資料。
+    is_backfill_only = args.backfill_days > 0 or (
+        args.date and target_date < date.today() - timedelta(days=3)
+    )
+    if is_backfill_only:
+        log.info("=== STEP 2: OHLCV from TWSE/TPEX 官方歷史 API ===")
+        ohlcv_map = _fetch_ohlcv_historical(dates)
+    else:
+        log.info("=== STEP 2: OHLCV（歷史 API + OpenAPI 覆蓋最新交易日）===")
+        ohlcv_map = _fetch_ohlcv_historical(dates)
+        date_set = set(dates)
+        openapi_map = _fetch_ohlcv_openapi(target_date)
+        for code, latest_df in openapi_map.items():
+            # OpenAPI 只回最新一日，確認它落在要同步的日期清單內才合併
+            latest_df = latest_df[latest_df["trade_date"].isin(date_set)]
+            if latest_df.empty:
+                continue
+            if code in ohlcv_map and not ohlcv_map[code].empty:
+                merged = pd.concat([ohlcv_map[code], latest_df])
+                ohlcv_map[code] = merged.drop_duplicates("trade_date", keep="last")
+            else:
+                ohlcv_map[code] = latest_df
 
     # Step 3: 逐日拉取三大法人並合併寫入
     for d in dates:
@@ -116,7 +169,7 @@ def main():
 # ------------------------------------------------------------------
 
 def _upsert_stock_info():
-    for code, (_, name, market) in WATCHLIST.items():
+    for code, (name, market) in WATCHLIST.items():
         db.execute(
             """
             INSERT INTO stock_info (stock_code, stock_name, market_type)
@@ -129,50 +182,202 @@ def _upsert_stock_info():
 
 
 # ------------------------------------------------------------------
-# Step 2: yfinance 批量拉取 OHLCV
+# Step 2a: TWSE / TPEX OpenAPI 拉取今日 OHLCV（官方端點）
 # ------------------------------------------------------------------
 
-def _fetch_ohlcv_batch(start: str, end: str) -> dict[str, pd.DataFrame]:
+def _fetch_ohlcv_openapi(target_date: date) -> dict[str, pd.DataFrame]:
     """
-    回傳 {stock_code: DataFrame(trade_date, open_price, high_price, low_price, close_price, volume)}
+    從 TWSE / TPEX OpenAPI 拉取最新交易日 OHLCV。
+    - 上市（.TW）  → https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
+    - 上櫃（.TWO） → https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes
+    OpenAPI 只提供最新交易日，不支援日期查詢。
     """
-    tickers = [v[0] for v in WATCHLIST.values()]
-    log.info(f"yfinance 拉取 {len(tickers)} 檔，區間 {start} ~ {end}")
-
-    raw = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-    )
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     result: dict[str, pd.DataFrame] = {}
-    for code, (ticker, _, _) in WATCHLIST.items():
-        try:
-            if len(tickers) == 1:
-                df = raw.copy()
-            else:
-                df = raw[ticker].copy()
 
-            df = df.dropna(subset=["Close"])
-            df = df.reset_index()
-            df = df.rename(columns={
-                "Date": "trade_date",
-                "Open": "open_price",
-                "High": "high_price",
-                "Low": "low_price",
-                "Close": "close_price",
-                "Volume": "volume",
-            })
-            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-            df = df[["trade_date", "open_price", "high_price", "low_price", "close_price", "volume"]]
-            # 台股 volume 單位轉換：yfinance 回傳股數，除以 1000 換算為張
-            df["volume"] = (df["volume"] / 1000).round(0).astype("int64")
+    # --- 上市（TWSE）---
+    try:
+        r = _api_get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+        twse_rows = {row["Code"]: row for row in r.json()}
+        for code in WATCHLIST:
+            if not code.endswith(".TW"):
+                continue
+            raw_code = code.replace(".TW", "")
+            row = twse_rows.get(raw_code)
+            if not row:
+                continue
+            def _f(s):
+                return float(str(s).replace(",", "") or "0")
+            trade_date = _parse_roc_date(row["Date"])
+            if not trade_date:
+                continue
+            df = pd.DataFrame([{
+                "trade_date":  trade_date,
+                "open_price":  _f(row["OpeningPrice"]),
+                "high_price":  _f(row["HighestPrice"]),
+                "low_price":   _f(row["LowestPrice"]),
+                "close_price": _f(row["ClosingPrice"]),
+                "volume":      int(_f(row["TradeVolume"]) / 1000),  # 股→張
+            }])
             result[code] = df
+        log.info(f"TWSE OpenAPI：取得 {sum(1 for c in result if c.endswith('.TW'))} 檔上市 OHLCV")
+    except Exception as e:
+        log.warning(f"TWSE OpenAPI OHLCV 失敗：{e}")
+
+    # --- 上櫃（TPEX）---
+    otc_codes = [c for c in WATCHLIST if c.endswith(".TWO")]
+    if otc_codes:
+        try:
+            r = _api_get(
+                "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                verify=False,
+            )
+            tpex_rows = {row.get("SecuritiesCompanyCode", "").strip(): row for row in r.json()}
+            for code in otc_codes:
+                raw_code = code.replace(".TWO", "")
+                row = tpex_rows.get(raw_code)
+                if not row:
+                    continue
+                def _f2(s):
+                    return float(str(s).replace(",", "") or "0")
+                trade_date = _parse_roc_date(row.get("Date", ""))
+                if not trade_date:
+                    continue
+                df = pd.DataFrame([{
+                    "trade_date":  trade_date,
+                    "open_price":  _f2(row.get("Open", 0)),
+                    "high_price":  _f2(row.get("High", 0)),
+                    "low_price":   _f2(row.get("Low", 0)),
+                    "close_price": _f2(row.get("Close", 0)),
+                    "volume":      int(_f2(row.get("TradingShares", 0)) / 1000),
+                }])
+                result[code] = df
+            log.info(f"TPEX OpenAPI：取得 {sum(1 for c in result if c.endswith('.TWO'))} 檔上櫃 OHLCV")
         except Exception as e:
-            log.warning(f"{code} OHLCV 拉取失敗：{e}")
+            log.warning(f"TPEX OpenAPI OHLCV 失敗：{e}")
+
+    return result
+
+
+def _parse_roc_date(roc_str: str):
+    """將民國日期字串（1150604）轉換為 date 物件。"""
+    try:
+        s = str(roc_str).strip()
+        if len(s) == 7:                          # 1150604
+            year = int(s[:3]) + 1911
+            month = int(s[3:5])
+            day = int(s[5:7])
+            return date(year, month, day)
+    except Exception:
+        pass
+    return None
+
+
+# ------------------------------------------------------------------
+# Step 2b: 官方歷史 OHLCV（TWSE STOCK_DAY / TPEX st43，按股票逐月拉取）
+# ------------------------------------------------------------------
+
+def _fetch_ohlcv_historical(dates: list[date]) -> dict[str, pd.DataFrame]:
+    """
+    使用官方 API 拉取歷史 OHLCV，每次呼叫 = 1 支股票 × 1 個月份。
+    - 上市（.TW） → TWSE rwd/zh/afterTrading/STOCK_DAY
+    - 上櫃（.TWO）→ TPEX web/stock/aftertrading/daily_trading_info/st43_print.php
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if not dates:
+        return {}
+
+    date_set = set(dates)
+    start_date, end_date = min(dates), max(dates)
+
+    # 計算需要的月份列表
+    months: list[tuple[int, int]] = []
+    d = start_date.replace(day=1)
+    end_month = end_date.replace(day=1)
+    while d <= end_month:
+        months.append((d.year, d.month))
+        d = d.replace(month=d.month + 1) if d.month < 12 else d.replace(year=d.year + 1, month=1)
+
+    def _parse_price(s) -> float:
+        return float(str(s).replace(",", "").strip() or "0")
+
+    result: dict[str, pd.DataFrame] = {}
+
+    for code in WATCHLIST:
+        raw_code = code.replace(".TW", "").replace(".TWO", "")
+        all_rows: list[dict] = []
+
+        if code.endswith(".TW"):
+            for year, month in months:
+                url = (
+                    f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+                    f"?stockNo={raw_code}&date={year}{month:02d}01&response=json"
+                )
+                try:
+                    r = _api_get(url)
+                    data = r.json()
+                    if data.get("stat") != "OK" or not data.get("data"):
+                        log.debug(f"TWSE STOCK_DAY {raw_code} {year}/{month:02d}：無資料")
+                        continue
+                    for row in data["data"]:
+                        parts = row[0].split("/")
+                        if len(parts) != 3:
+                            continue
+                        td = date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+                        if td not in date_set:
+                            continue
+                        all_rows.append({
+                            "trade_date":  td,
+                            "open_price":  _parse_price(row[3]),
+                            "high_price":  _parse_price(row[4]),
+                            "low_price":   _parse_price(row[5]),
+                            "close_price": _parse_price(row[6]),
+                            "volume":      int(_parse_price(row[1]) / 1000),  # 股→張
+                        })
+                except Exception as e:
+                    log.warning(f"TWSE STOCK_DAY {raw_code} {year}/{month:02d} 失敗：{e}")
+
+        elif code.endswith(".TWO"):
+            for year, month in months:
+                roc_year = year - 1911
+                url = (
+                    f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info"
+                    f"/st43_print.php?l=zh-tw&d={roc_year}/{month:02d}&stkno={raw_code}&s=0,asc,0"
+                )
+                try:
+                    r = _api_get(url, verify=False)
+                    if not r.text.strip():
+                        log.debug(f"TPEX st43 {raw_code} {year}/{month:02d}：空回應")
+                        continue
+                    data = r.json()
+                    for row in data.get("aaData", []):
+                        parts = row[0].split("/")
+                        if len(parts) != 3:
+                            continue
+                        td = date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+                        if td not in date_set:
+                            continue
+                        # st43 欄位：[0]日期, [1]成交股數, [2]成交金額, [3]開盤, [4]最高, [5]最低, [6]收盤
+                        all_rows.append({
+                            "trade_date":  td,
+                            "open_price":  _parse_price(row[3]),
+                            "high_price":  _parse_price(row[4]),
+                            "low_price":   _parse_price(row[5]),
+                            "close_price": _parse_price(row[6]),
+                            "volume":      int(_parse_price(row[1]) / 1000),  # 股→張
+                        })
+                except Exception as e:
+                    log.warning(f"TPEX st43 {raw_code} {year}/{month:02d} 失敗：{e}")
+
+        if all_rows:
+            result[code] = pd.DataFrame(all_rows)
+            log.info(f"{code} 歷史 OHLCV：{len(all_rows)} 筆")
+        else:
+            log.warning(f"{code} 歷史 OHLCV：無資料")
 
     return result
 
@@ -187,11 +392,11 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
     """
     date_str = target_date.strftime("%Y%m%d")
     url = (
-        "https://www.twse.com.tw/fund/T86"
+        "https://www.twse.com.tw/rwd/zh/fund/T86"
         f"?response=json&date={date_str}&selectType=ALLBUT0999"
     )
     try:
-        resp = requests.get(url, timeout=15)
+        resp = _api_get(url)
         data = resp.json()
     except Exception as e:
         log.warning(f"TWSE 三大法人 API 失敗 ({target_date})：{e}")
@@ -237,28 +442,70 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
 
 def _fetch_chips_tpex(target_date: date) -> dict[str, dict]:
     """
-    使用 TPEX JSON API 拉取上櫃股三大法人資料。
-    TPEX 憑證有已知問題（Missing Subject Key Identifier），使用 verify=False。
+    拉取上櫃股三大法人資料。
+    - 當日資料：使用 TPEX OpenAPI（穩定，無 SSL 問題）
+    - 歷史資料：使用舊版 Web API（帶日期參數）
     """
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+    if target_date >= date.today():
+        return _fetch_chips_tpex_openapi(target_date)
+    else:
+        return _fetch_chips_tpex_legacy(target_date)
+
+
+def _fetch_chips_tpex_openapi(target_date: date) -> dict[str, dict]:
+    """TPEX OpenAPI — 只返回最新交易日資料，無需日期參數，無 SSL 問題。"""
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
+    try:
+        resp = _api_get(url, verify=False)
+        rows = resp.json()
+    except Exception as e:
+        log.warning(f"TPEX OpenAPI 失敗 ({target_date})：{e}")
+        return {}
+
+    FK = "ForeignInvestorsIncludeMainlandAreaInvestors-Difference"
+    IK = "SecuritiesInvestmentTrustCompanies-Difference"
+    DK = "Dealers-Difference"
+
+    def p(s) -> int:
+        try:
+            return int(str(s).replace(",", "").replace("+", "").strip() or "0")
+        except ValueError:
+            return 0
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        code = f"{row.get('SecuritiesCompanyCode', '').strip()}.TWO"
+        if code not in WATCHLIST:
+            continue
+        result[code] = {
+            "foreign_buy":    p(row.get(FK, 0)),
+            "investment_buy": p(row.get(IK, 0)),
+            "dealer_buy":     p(row.get(DK, 0)),
+        }
+
+    log.info(f"TPEX OpenAPI：成功解析 {len(result)} 筆（{target_date}）")
+    return result
+
+
+def _fetch_chips_tpex_legacy(target_date: date) -> dict[str, dict]:
+    """TPEX 舊版 Web API — 支援歷史日期，用於 backfill。"""
+    import urllib3, time as _time
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     roc_year = target_date.year - 1911
     date_str = f"{roc_year}/{target_date.month:02d}/{target_date.day:02d}"
-    import time as _time
     ts = int(_time.time() * 1000)
     url = (
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_print.php"
         f"?l=zh-tw&se=AL&t=D&d={date_str}&_={ts}"
     )
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-        "Referer": "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade.php?l=zh-tw",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-    }
     try:
-        resp = requests.get(url, timeout=15, headers=headers, verify=False)
+        resp = _api_get(url, verify=False)
         if not resp.text.strip():
             log.debug(f"TPEX {target_date}：空回應（可能假日或停市）")
             return {}
@@ -270,31 +517,21 @@ def _fetch_chips_tpex(target_date: date) -> dict[str, dict]:
     rows = data.get("aaData", [])
     result: dict[str, dict] = {}
     for row in rows:
-        code_raw = row[0].strip()
-        code = f"{code_raw}.TWO"
+        code = f"{row[0].strip()}.TWO"
         if code not in WATCHLIST:
             continue
         try:
-            def parse_int(s) -> int:
+            def p(s) -> int:
                 return int(str(s).replace(",", "").replace("+", "").strip() or "0")
-
-            # TPEX 欄位（大約）：[0]代號 [1]名稱
-            # [2]外資買 [3]外資賣 [4]外資淨
-            # [5]投信買 [6]投信賣 [7]投信淨
-            # [8]自營買 [9]自營賣 [10]自營淨
-            foreign_net = parse_int(row[4])
-            invest_net = parse_int(row[7])
-            dealer_net = parse_int(row[10]) if len(row) > 10 else 0
-
             result[code] = {
-                "foreign_buy": foreign_net,
-                "investment_buy": invest_net,
-                "dealer_buy": dealer_net,
+                "foreign_buy":    p(row[4]),
+                "investment_buy": p(row[7]),
+                "dealer_buy":     p(row[10]) if len(row) > 10 else 0,
             }
         except (ValueError, IndexError) as e:
             log.debug(f"解析 TPEX {code} 失敗：{e}")
 
-    log.info(f"TPEX 三大法人：成功解析 {len(result)} 筆（{target_date}）")
+    log.info(f"TPEX legacy：成功解析 {len(result)} 筆（{target_date}）")
     return result
 
 

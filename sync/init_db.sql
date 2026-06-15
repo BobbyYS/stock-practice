@@ -39,6 +39,29 @@ CREATE TABLE IF NOT EXISTS stock_daily_data (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ==========================================
+-- TABLE 2b: 盤中即時報價快照表（每檔僅保留最新一筆，每次同步覆蓋）
+-- 資料來源：TWSE/TPEX MIS 即時報價 API（mis.twse.com.tw）
+-- ==========================================
+CREATE TABLE IF NOT EXISTS stock_intraday_quotes (
+    stock_code    VARCHAR(10)    NOT NULL COMMENT '股票代碼，格式如 2330.TW / 8043.TWO',
+    trade_date    DATE           NOT NULL COMMENT 'API 回報的交易日期',
+    last_price    DECIMAL(10, 2) DEFAULT NULL COMMENT '最新成交價（無成交時以買價/開盤價回補）',
+    open_price    DECIMAL(10, 2) DEFAULT NULL COMMENT '當日開盤價',
+    high_price    DECIMAL(10, 2) DEFAULT NULL COMMENT '當日最高價',
+    low_price     DECIMAL(10, 2) DEFAULT NULL COMMENT '當日最低價',
+    prev_close    DECIMAL(10, 2) DEFAULT NULL COMMENT '昨日收盤價',
+    change_amount DECIMAL(10, 2) DEFAULT NULL COMMENT '漲跌（last_price - prev_close）',
+    change_pct    DECIMAL(7, 2)  DEFAULT NULL COMMENT '漲跌幅 %',
+    volume        BIGINT         DEFAULT 0 COMMENT '當日累積成交張數',
+    bid_price     DECIMAL(10, 2) DEFAULT NULL COMMENT '最佳一檔買價',
+    ask_price     DECIMAL(10, 2) DEFAULT NULL COMMENT '最佳一檔賣價',
+    quote_time    VARCHAR(8)     DEFAULT NULL COMMENT 'API 撮合時間 HH:MM:SS',
+    updated_at    TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        COMMENT '本筆快照寫入時間',
+    PRIMARY KEY (stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ==========================================
 -- TABLE 3: 每日策略選股與量化因子表（CHOSE & DRIVE 數據核心）
 -- ==========================================
 CREATE TABLE IF NOT EXISTS daily_strategy_results (
