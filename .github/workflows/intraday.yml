@@ -1,0 +1,54 @@
+name: 盤中即時報價同步
+
+on:
+  # 台北 09:00–13:55（UTC+8）= UTC 01:00–05:55，平日每 5 分鐘
+  # 註：GitHub Actions 排程有延遲且高負載時可能略過，非保證精準。
+  schedule:
+    - cron: "*/5 1-5 * * 1-5"
+  workflow_dispatch:        # 支援手動觸發
+
+# 後一次排程不需等前一次（即時報價以最新為準），但避免同時多跑：取消進行中的
+concurrency:
+  group: intraday-sync
+  cancel-in-progress: true
+
+jobs:
+  intraday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets.toml from GitHub Secrets
+        run: |
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml << EOF
+          [tidb]
+          host     = "${{ secrets.TIDB_HOST }}"
+          port     = ${{ secrets.TIDB_PORT }}
+          user     = "${{ secrets.TIDB_USER }}"
+          password = "${{ secrets.TIDB_PASSWORD }}"
+          database = "${{ secrets.TIDB_DATABASE }}"
+          ssl_ca   = ""
+
+          [app]
+          user_id  = "etl_bot"
+          EOF
+
+      - name: Run intraday quote sync
+        run: python sync/sync_intraday.py
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f .streamlit/secrets.toml
