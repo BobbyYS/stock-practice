@@ -1,0 +1,90 @@
+name: EPS 同步 / 歷史回補
+
+on:
+  # 手動觸發：用於歷史回補，或補跑最新一季
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "模式：backfill（歷史回補）或 latest（只抓最新一季）"
+        required: false
+        default: "backfill"
+      years:
+        description: "回補近 N 年（如 5）。填此欄優先（僅 backfill 模式）"
+        required: false
+        default: ""
+      from_year:
+        description: "起始年份（西元，如 2021），搭配 to_year"
+        required: false
+        default: ""
+      to_year:
+        description: "結束年份（西元，如 2025），搭配 from_year"
+        required: false
+        default: ""
+  # 季報公告後各跑一次（最新一季）：5/16、8/16、11/16、隔年 4/1（台北＝UTC+8）
+  schedule:
+    - cron: "0 1 16 5,8,11 *"
+    - cron: "0 1 1 4 *"
+
+jobs:
+  eps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets.toml from GitHub Secrets
+        run: |
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml << EOF
+          [tidb]
+          host     = "${{ secrets.TIDB_HOST }}"
+          port     = ${{ secrets.TIDB_PORT }}
+          user     = "${{ secrets.TIDB_USER }}"
+          password = "${{ secrets.TIDB_PASSWORD }}"
+          database = "${{ secrets.TIDB_DATABASE }}"
+          ssl_ca   = ""
+
+          [app]
+          user_id  = "etl_bot"
+          EOF
+
+      - name: Run EPS sync
+        run: |
+          # 排程觸發（無 inputs）→ 一律抓最新一季
+          if [ -z "${{ github.event.inputs.mode }}" ]; then
+            echo "排程：同步最新一季 EPS"
+            python sync/sync_eps.py
+            exit 0
+          fi
+
+          if [ "${{ github.event.inputs.mode }}" = "latest" ]; then
+            echo "執行：python sync/sync_eps.py（最新一季）"
+            python sync/sync_eps.py
+          else
+            ARGS="--backfill"
+            if [ -n "${{ github.event.inputs.years }}" ]; then
+              ARGS="$ARGS --years ${{ github.event.inputs.years }}"
+            elif [ -n "${{ github.event.inputs.from_year }}" ] || [ -n "${{ github.event.inputs.to_year }}" ]; then
+              [ -n "${{ github.event.inputs.from_year }}" ] && ARGS="$ARGS --from-year ${{ github.event.inputs.from_year }}"
+              [ -n "${{ github.event.inputs.to_year }}" ]   && ARGS="$ARGS --to-year ${{ github.event.inputs.to_year }}"
+            else
+              ARGS="$ARGS --years 5"
+            fi
+            echo "執行：python sync/sync_eps.py $ARGS"
+            python sync/sync_eps.py $ARGS
+          fi
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f .streamlit/secrets.toml
