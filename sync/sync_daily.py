@@ -161,6 +161,9 @@ def main():
         _upsert_daily_data(d, ohlcv_map, chips)
         time.sleep(0.5)  # 避免 API 過快觸發限流
 
+    # Step 4: 順帶同步最新一季 EPS（有資料才寫，無資料則跳過，不影響 OHLCV）
+    _sync_eps_daily()
+
     log.info("✅ ETL 同步完畢")
 
 
@@ -591,6 +594,32 @@ def _upsert_daily_data(
         upsert_count += 1
 
     log.info(f"stock_daily_data upsert：{upsert_count} 筆（{target_date}）")
+
+
+# ------------------------------------------------------------------
+# Step 4: 每日順帶同步最新一季 EPS（委派給 sync_eps，僅最新一季）
+# ------------------------------------------------------------------
+
+def _sync_eps_daily():
+    """
+    每日 ETL 尾端順帶更新最新一季 EPS：
+      - 有資料 → upsert（update-or-insert）到 stock_eps（並補全 stock_info）
+      - 無資料 / API 失敗 → 記錄並跳過，不影響上方 OHLCV 同步
+    EPS 為季資料，多數日子抓到的是同一季（冪等覆寫），季報公告後會自動更新為新季。
+    """
+    try:
+        # 確保同層的 sync_eps 可被 import
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sync_eps  # noqa: E402
+
+        rows = sync_eps.fetch_all_eps()
+        if not rows:
+            log.info("EPS：本次無資料，跳過")
+            return
+        sync_eps._upsert_stock_info(rows)
+        sync_eps._upsert_eps(rows)
+    except Exception as e:
+        log.warning(f"EPS 同步失敗（不影響 OHLCV）：{e}")
 
 
 if __name__ == "__main__":
