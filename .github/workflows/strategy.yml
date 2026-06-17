@@ -1,0 +1,73 @@
+name: 策略選股 (CHOSE/DRIVE)
+
+on:
+  # 手動觸發
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "計算交易日（YYYY-MM-DD，留空=資料庫最新交易日）"
+        required: false
+        default: ""
+      sync_days:
+        description: "自動補齊往回的全市場交易日數（留空=預設約 220）"
+        required: false
+        default: ""
+      no_backtest:
+        description: "跳過 3 年回測（true / false）"
+        required: false
+        default: "false"
+  # 盤後排程：台北 16:40（UTC 08:40）平日，於每日 ETL（15:45）之後執行
+  schedule:
+    - cron: "40 8 * * 1-5"
+
+# 避免與前一次重疊
+concurrency:
+  group: strategy-build
+  cancel-in-progress: false
+
+jobs:
+  strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets.toml from GitHub Secrets
+        run: |
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml << EOF
+          [tidb]
+          host     = "${{ secrets.TIDB_HOST }}"
+          port     = ${{ secrets.TIDB_PORT }}
+          user     = "${{ secrets.TIDB_USER }}"
+          password = "${{ secrets.TIDB_PASSWORD }}"
+          database = "${{ secrets.TIDB_DATABASE }}"
+          ssl_ca   = ""
+
+          [app]
+          user_id  = "etl_bot"
+          EOF
+
+      - name: Run strategy screening
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.date }}" ]      && ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          [ -n "${{ github.event.inputs.sync_days }}" ] && ARGS="$ARGS --sync-days ${{ github.event.inputs.sync_days }}"
+          [ "${{ github.event.inputs.no_backtest }}" = "true" ] && ARGS="$ARGS --no-backtest"
+          echo "執行：python sync/build_strategy.py $ARGS"
+          python sync/build_strategy.py $ARGS
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f .streamlit/secrets.toml
