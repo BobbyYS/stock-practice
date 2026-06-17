@@ -321,7 +321,19 @@ def main():
     parser = argparse.ArgumentParser(description="每日策略選股引擎")
     parser.add_argument("--date", default=None, help="計算的交易日 YYYY-MM-DD，預設資料庫最新交易日")
     parser.add_argument("--no-backtest", action="store_true", help="跳過 3 年回測")
+    parser.add_argument("--no-sync", action="store_true",
+                        help="不要自動補齊缺漏交易日（預設會補）")
+    parser.add_argument("--sync-days", type=int, default=MIN_ROWS_SCAN + 20,
+                        help="自動補齊時往回確保的全市場交易日數（預設約一年）")
     args = parser.parse_args()
+
+    # Step 0: 自動補齊缺漏交易日（遇缺先同步全市場進 TiDB，再繼續篩選）
+    if not args.no_sync:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import market_sync  # noqa: E402
+        end_date = date.fromisoformat(args.date) if args.date else date.today()
+        log.info(f"=== Step 0: 檢查/補齊全市場資料（往回 {args.sync_days} 個交易日）===")
+        market_sync.ensure_history(end_date, args.sync_days)
 
     # 決定 trade_date（資料庫最新交易日）
     if args.date:
@@ -330,7 +342,7 @@ def main():
         d = db.query_df("SELECT MAX(trade_date) AS d FROM stock_daily_data")
         val = d["d"].iloc[0]
         if val is None:
-            log.warning("stock_daily_data 無資料，請先執行 ETL 同步。")
+            log.warning("stock_daily_data 無資料，且自動補齊未取得資料。")
             return
         trade_date = val if isinstance(val, date) else date.fromisoformat(str(val))
 
