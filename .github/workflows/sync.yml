@@ -48,9 +48,6 @@ jobs:
 
           [app]
           user_id  = "etl_bot"
-
-          [finmind]
-          token = "${{ secrets.FINMIND_TOKEN }}"
           EOF
 
       - name: Run ETL sync
