@@ -8,3 +8,7 @@ __pycache__/
 
 # 編輯器/系統
 .DS_Store
+
+# sync/ 底下的工作用資料清單（可用 SKILL.md 裡記載的 SQL 隨時重新產生，不進版本控制）
+sync/corp_action_candidates.csv
+sync/corp_action_candidates_illiquid.csv
