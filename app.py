@@ -109,7 +109,7 @@ def _render_review_page():
                 return "color: #EF5350" if float(val) < 0 else "color: #26A69A"
 
             st.dataframe(
-                df.style.applymap(_style_pnl, subset=["pnl_percent"]),
+                df.style.map(_style_pnl, subset=["pnl_percent"]),
                 use_container_width=True,
                 hide_index=True,
             )

@@ -74,6 +74,22 @@ def fetch_latest_strategy_date() -> str | None:
 
 
 @st.cache_data(ttl=3600)
+def fetch_corp_actions() -> pd.DataFrame:
+    """
+    撈出全部已確認的公司行動（減資/分割/合併）調整紀錄，JOIN stock_info 取中文名稱，
+    按生效日新到舊排序。用於選股雷達顯示，也用於標示哪些股票的技術指標經過係數校正。
+    """
+    sql = """
+        SELECT a.stock_code, s.stock_name, a.ex_date, a.adjust_factor,
+               a.action_type, a.note
+        FROM stock_corp_actions a
+        JOIN stock_info s USING (stock_code)
+        ORDER BY a.ex_date DESC
+    """
+    return query_df(sql)
+
+
+@st.cache_data(ttl=3600)
 def fetch_strategy_by_date(trade_date: str) -> pd.DataFrame:
     """撈出指定日期全部策略選股紀錄，JOIN stock_info 取中文名稱。"""
     sql = """
@@ -83,7 +99,9 @@ def fetch_strategy_by_date(trade_date: str) -> pd.DataFrame:
             d.is_chose_trigger, d.pattern_type, d.chose_reason,
             d.is_drive_trigger, d.drive_score, d.rs_rating, d.chip_feature,
             d.suggested_entry, d.stop_loss, d.target_price_1, d.target_price_2,
-            d.backtest_win_rate, d.backtest_total_pnl
+            d.backtest_win_rate, d.backtest_total_pnl,
+            d.fwd_return_5d_win_rate, d.fwd_return_10d_win_rate, d.fwd_return_20d_win_rate,
+            d.fwd_return_5d_n, d.fwd_return_10d_n, d.fwd_return_20d_n
         FROM daily_strategy_results d
         JOIN stock_info s USING (stock_code)
         WHERE d.trade_date = :dt
