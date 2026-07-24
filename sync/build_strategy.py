@@ -75,7 +75,44 @@ class Bars:
         return len(self.close)
 
 
-def _load_bars(stock_code: str) -> Bars | None:
+def _fetch_corp_actions(stock_code: str | None = None) -> dict[str, list[tuple[date, float]]]:
+    """讀取 stock_corp_actions 調整係數，回傳 {stock_code: [(ex_date, factor), ...]}（按日期升冪）。
+    不帶 stock_code 時一次抓全表（給 main() 迴圈用，避免每檔股票各查一次）。"""
+    sql = "SELECT stock_code, ex_date, adjust_factor FROM stock_corp_actions"
+    params: dict = {}
+    if stock_code:
+        sql += " WHERE stock_code = :code"
+        params["code"] = stock_code
+    sql += " ORDER BY stock_code, ex_date"
+    df = db.query_df(sql, params)
+    out: dict[str, list[tuple[date, float]]] = {}
+    for _, row in df.iterrows():
+        ex_date = row["ex_date"] if isinstance(row["ex_date"], date) else date.fromisoformat(str(row["ex_date"]))
+        out.setdefault(row["stock_code"], []).append((ex_date, float(row["adjust_factor"])))
+    return out
+
+
+def _apply_corp_actions(df: pd.DataFrame, actions: list[tuple[date, float]] | None) -> pd.DataFrame:
+    """對 ex_date 之前的 OHLC 套用調整係數，還原成連續價格序列（volume 反向調整維持量能連續）。
+    只調整「已經發生」的事件（ex_date <= 資料序列最後一天），避免誤調整尚未發生的未來事件。"""
+    if not actions or df.empty:
+        return df
+    df["volume"] = df["volume"].astype(float)   # 量能欄位原始為整數，調整後可能非整數，先轉型避免指派報錯
+    as_of = df["trade_date"].max()
+    for ex_date, factor in actions:
+        if ex_date > as_of:
+            continue
+        mask = df["trade_date"] < ex_date
+        for col in ["open_price", "high_price", "low_price", "close_price"]:
+            df.loc[mask, col] = df.loc[mask, col].astype(float) * factor
+        df.loc[mask, "volume"] = df.loc[mask, "volume"] / factor
+    return df
+
+
+def _load_bars(
+    stock_code: str,
+    corp_actions: dict[str, list[tuple[date, float]]] | None = None,
+) -> Bars | None:
     df = db.query_df(
         """
         SELECT trade_date, open_price, high_price, low_price, close_price, volume
@@ -87,6 +124,9 @@ def _load_bars(stock_code: str) -> Bars | None:
     )
     if df.empty:
         return None
+    if corp_actions is None:
+        corp_actions = _fetch_corp_actions(stock_code)
+    df = _apply_corp_actions(df, corp_actions.get(stock_code))
     return Bars(df)
 
 
@@ -205,9 +245,32 @@ def analyze_drive(bars: Bars, bench_roc: float) -> dict | None:
 # 3 年回測（移植，成交量改張、移除 price>20）
 # ------------------------------------------------------------------
 
-def backtest_3y(bars: Bars, bench_roc_series: dict) -> tuple[float, float]:
+FORWARD_RETURN_DAYS = (5, 10, 20)   # 進場後第 N 個交易日的正報酬機率統計
+
+
+def _empty_backtest_result() -> dict:
+    result = {"win_rate": 0.0, "total_pnl": 0.0}
+    for n in FORWARD_RETURN_DAYS:
+        result[f"fwd_win_rate_{n}"] = None
+        result[f"fwd_n_{n}"] = None
+    return result
+
+
+def backtest_3y(bars: Bars, bench_roc_series: dict) -> dict:
+    """
+    3 年回測（進出場依考特買賣法則）＋ 進場後第 N 個交易日正報酬機率統計。
+
+    回傳 dict：
+      win_rate / total_pnl：既有的交易勝率／總報酬（考特賣出法則出場，不變）
+      fwd_win_rate_{5,10,20}：與 win_rate 用「同一批」CHOSE 進場點，比對進場後第 N 個
+        交易日收盤價是否仍高於進場價，計算「仍為正報酬」的歷史機率（%）。跟 win_rate
+        不同的是這個看的是「固定 N 天後」，win_rate 看的是「考特法則實際出場」時的損益，
+        兩者搭配可以看出「短期是否容易先蜜月拉回」還是「一路噴發」。
+      fwd_n_{5,10,20}：上述統計的樣本數——最近的進場點可能不滿 N 個交易日的未來資料
+        （尤其 5 日窗口離今天太近時），這些會被排除在分母外，不會當作 0% 硬湊。
+    """
     if len(bars) < MIN_ROWS_BACKTEST:
-        return 0.0, 0.0
+        return _empty_backtest_result()
     c = bars.close; h = bars.high; o = bars.open; v = bars.vol
     ma10 = c.rolling(10).mean()
     ma20 = c.rolling(20).mean()
@@ -216,6 +279,7 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> tuple[float, float]:
     avg_vol_20 = v.rolling(20).mean()
 
     trades: list[float] = []
+    entry_indices: list[int] = []
     in_pos = False
     entry_p = 0.0
     start_idx = max(len(bars) - 750, 250)   # 確保 i-250 不越界
@@ -243,6 +307,7 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> tuple[float, float]:
             if is_flag or is_gap or is_vcp:
                 entry_p = curr_c
                 in_pos = True
+                entry_indices.append(i)
         else:
             # 出場：考特賣出法則
             r_mult = (curr_c - entry_p) / (entry_p * INIT_STOP_PCT)
@@ -257,11 +322,27 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> tuple[float, float]:
                 trades.append((curr_c - entry_p) / entry_p)
                 in_pos = False
 
-    if not trades:
-        return 0.0, 0.0
-    wr = len([t for t in trades if t > 0]) / len(trades) * 100
-    tr = (np.prod([1 + t for t in trades]) - 1) * 100
-    return round(float(wr), 1), round(float(tr), 1)
+    result = _empty_backtest_result()
+    if trades:
+        wr = len([t for t in trades if t > 0]) / len(trades) * 100
+        tr = (np.prod([1 + t for t in trades]) - 1) * 100
+        result["win_rate"] = round(float(wr), 1)
+        result["total_pnl"] = round(float(tr), 1)
+
+    for n in FORWARD_RETURN_DAYS:
+        ups = total = 0
+        for idx in entry_indices:
+            fwd_idx = idx + n
+            if fwd_idx >= len(bars):
+                continue   # 資料不足 N 天，這個進場點不計入分母（不當成負報酬硬湊）
+            total += 1
+            if float(c.iloc[fwd_idx]) > float(c.iloc[idx]):
+                ups += 1
+        if total > 0:
+            result[f"fwd_win_rate_{n}"] = round(ups / total * 100, 1)
+            result[f"fwd_n_{n}"] = total
+
+    return result
 
 
 # ------------------------------------------------------------------
@@ -269,13 +350,14 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> tuple[float, float]:
 # ------------------------------------------------------------------
 
 def _upsert_result(trade_date: date, code: str, chose: dict | None,
-                   drive: dict | None, wr: float | None, tr: float | None):
+                   drive: dict | None, backtest: dict | None):
     rs = (chose or drive or {}).get("rs_rating")
     entry = chose["suggested_entry"] if chose else None
     stop = round(entry * (1 - INIT_STOP_PCT), 2) if entry else None
     # 目標價以 R 倍數推估（R = entry * 7%）：第一目標 2R、第二目標 3R
     t1 = round(entry * (1 + 2 * INIT_STOP_PCT), 2) if entry else None
     t2 = round(entry * (1 + 3 * INIT_STOP_PCT), 2) if entry else None
+    bt = backtest or {}
 
     db.execute(
         """
@@ -283,10 +365,13 @@ def _upsert_result(trade_date: date, code: str, chose: dict | None,
             (trade_date, stock_code, is_chose_trigger, pattern_type, chose_reason,
              is_drive_trigger, drive_score, rs_rating, chip_feature,
              suggested_entry, stop_loss, target_price_1, target_price_2,
-             backtest_win_rate, backtest_total_pnl)
+             backtest_win_rate, backtest_total_pnl,
+             fwd_return_5d_win_rate, fwd_return_10d_win_rate, fwd_return_20d_win_rate,
+             fwd_return_5d_n, fwd_return_10d_n, fwd_return_20d_n)
         VALUES
             (:dt, :code, :ct, :pt, :cr, :dt2, :ds, :rs, :cf,
-             :se, :sl, :t1, :t2, :wr, :tr)
+             :se, :sl, :t1, :t2, :wr, :tr,
+             :fwr5, :fwr10, :fwr20, :fn5, :fn10, :fn20)
         ON DUPLICATE KEY UPDATE
             is_chose_trigger = VALUES(is_chose_trigger),
             pattern_type     = VALUES(pattern_type),
@@ -300,7 +385,13 @@ def _upsert_result(trade_date: date, code: str, chose: dict | None,
             target_price_1   = VALUES(target_price_1),
             target_price_2   = VALUES(target_price_2),
             backtest_win_rate  = VALUES(backtest_win_rate),
-            backtest_total_pnl = VALUES(backtest_total_pnl)
+            backtest_total_pnl = VALUES(backtest_total_pnl),
+            fwd_return_5d_win_rate  = VALUES(fwd_return_5d_win_rate),
+            fwd_return_10d_win_rate = VALUES(fwd_return_10d_win_rate),
+            fwd_return_20d_win_rate = VALUES(fwd_return_20d_win_rate),
+            fwd_return_5d_n  = VALUES(fwd_return_5d_n),
+            fwd_return_10d_n = VALUES(fwd_return_10d_n),
+            fwd_return_20d_n = VALUES(fwd_return_20d_n)
         """,
         {
             "dt": str(trade_date), "code": code,
@@ -312,9 +403,44 @@ def _upsert_result(trade_date: date, code: str, chose: dict | None,
             "rs": rs,
             "cf": drive["chip_feature"] if drive else None,
             "se": entry, "sl": stop, "t1": t1, "t2": t2,
-            "wr": wr, "tr": tr,
+            "wr": bt.get("win_rate"), "tr": bt.get("total_pnl"),
+            "fwr5": bt.get("fwd_win_rate_5"), "fwr10": bt.get("fwd_win_rate_10"),
+            "fwr20": bt.get("fwd_win_rate_20"),
+            "fn5": bt.get("fwd_n_5"), "fn10": bt.get("fwd_n_10"), "fn20": bt.get("fwd_n_20"),
         },
     )
+
+
+def _cleanup_stale_results(trade_date: date, stale_codes: list[str]) -> int:
+    """
+    自我修復：把「今天判定為 stale（行情資料跟不上 trade_date）」的股票，對照
+    daily_strategy_results 裡是否殘留著這個 trade_date 的舊紀錄——若有，代表那筆紀錄
+    是在更早、這檔股票資料還跟得上時寫入的，現在已經跟目前的 stock_daily_data 矛盾
+    （股票可能已下市/停止交易，或同步中斷），選股雷達不該再顯示這種「看起來是當天
+    觸發、實際上是舊資料殘影」的訊號，一併清掉。
+
+    2026-07-24：實際在正式環境抓到 4 檔股票、18 筆這種矛盾紀錄（詳見對話紀錄），
+    人工確認後刪除；加這段是為了讓同樣情況以後不需要人工介入就能自動收拾，不管
+    根源是什麼（股票下市、同步中斷、或任何未來才會出現的成因）。
+    """
+    if not stale_codes:
+        return 0
+    hits = db.query_df(
+        "SELECT stock_code FROM daily_strategy_results WHERE trade_date = :dt AND stock_code IN :codes",
+        {"dt": str(trade_date), "codes": tuple(stale_codes)},
+    )
+    n = len(hits)
+    if n == 0:
+        return 0
+    db.execute(
+        "DELETE FROM daily_strategy_results WHERE trade_date = :dt AND stock_code IN :codes",
+        {"dt": str(trade_date), "codes": tuple(stale_codes)},
+    )
+    log.warning(
+        f"⚠️ 清除 {n} 筆與行情資料矛盾的殘留紀錄 @ {trade_date}："
+        f"{hits['stock_code'].tolist()}"
+    )
+    return n
 
 
 def main():
@@ -360,12 +486,22 @@ def main():
     )["stock_code"].tolist()
     log.info(f"掃描 {len(codes)} 檔股票…")
 
-    n_chose = n_drive = n_written = 0
+    corp_actions = _fetch_corp_actions()
+    if corp_actions:
+        log.info(f"公司行動調整表：{len(corp_actions)} 檔股票有登記減資/分割/合併調整")
+
+    n_chose = n_drive = n_written = n_stale = 0
+    stale_codes: list[str] = []
     for code in codes:
         if code == BENCH_CODE:
             continue
-        bars = _load_bars(code)
+        bars = _load_bars(code, corp_actions)
         if bars is None or len(bars) < MIN_ROWS_SCAN:
+            continue
+        if bars.dates[-1] != trade_date:
+            # 該股同步進度落後於目標交易日，資料是舊的，不能當作當日訊號
+            n_stale += 1
+            stale_codes.append(code)
             continue
 
         chose = analyze_chose(bars, bench20)
@@ -373,17 +509,20 @@ def main():
         if not chose and not drive:
             continue
 
-        wr = tr = None
+        backtest = None
         if chose and not args.no_backtest:
-            wr, tr = backtest_3y(bars, bench_series)
+            backtest = backtest_3y(bars, bench_series)
 
-        _upsert_result(trade_date, code, chose, drive, wr, tr)
+        _upsert_result(trade_date, code, chose, drive, backtest)
         n_written += 1
         n_chose += 1 if chose else 0
         n_drive += 1 if drive else 0
 
+    n_cleaned = _cleanup_stale_results(trade_date, stale_codes)
+
     log.info(f"✅ 策略選股完成：寫入 {n_written} 檔"
-             f"（CHOSE {n_chose} / DRIVE {n_drive}）@ {trade_date}")
+             f"（CHOSE {n_chose} / DRIVE {n_drive}，略過 {n_stale} 檔舊資料，"
+             f"清除 {n_cleaned} 筆與行情資料矛盾的殘留紀錄）@ {trade_date}")
 
 
 if __name__ == "__main__":

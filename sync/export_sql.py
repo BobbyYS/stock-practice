@@ -185,6 +185,7 @@ def _download_chips_all(start_date: date, end_date: date) -> dict[date, dict[str
 
 
 def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
+    """依欄位名稱動態比對（新舊版皆可），詳見 sync_daily._fetch_chips_twse 的說明。"""
     date_str = target_date.strftime("%Y%m%d")
     url = (f"https://www.twse.com.tw/fund/T86"
            f"?response=json&date={date_str}&selectType=ALLBUT0999")
@@ -192,16 +193,31 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
         data = requests.get(url, timeout=15).json()
         if data.get("stat") != "OK":
             return {}
+
+        fields = data.get("fields") or []
+
+        def p(s): return int(str(s).replace(",", "").replace("+", "") or "0")
+
+        foreign_idxs = [
+            i for i, f in enumerate(fields)
+            if "買賣超股數" in f and "外" in f and f != "自營商買賣超股數"
+            and "自行買賣" not in f and "避險" not in f
+        ]
+        invest_idx = fields.index("投信買賣超股數") if "投信買賣超股數" in fields else None
+        dealer_idx = fields.index("自營商買賣超股數") if "自營商買賣超股數" in fields else None
+        if not foreign_idxs or invest_idx is None or dealer_idx is None:
+            log.debug(f"TWSE {target_date}：欄位比對失敗 fields={fields}")
+            return {}
+
         result = {}
         for row in data.get("data", []):
             code = f"{row[0].strip()}.TW"
             if code not in WATCHLIST:
                 continue
-            def p(s): return int(str(s).replace(",", "").replace("+", "") or "0")
             result[code] = {
-                "foreign_buy": p(row[4]),
-                "investment_buy": p(row[7]),
-                "dealer_buy": p(row[13]) if len(row) > 13 else p(row[10]),
+                "foreign_buy": sum(p(row[i]) for i in foreign_idxs),
+                "investment_buy": p(row[invest_idx]),
+                "dealer_buy": p(row[dealer_idx]),
             }
         return result
     except Exception as e:
@@ -210,23 +226,42 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
 
 
 def _fetch_chips_tpex(target_date: date) -> dict[str, dict]:
+    """
+    舊版 3itrade_print.php 端點已失效（302 導向 /errors），改用新版
+    insti/dailyTrade（無具名分組欄位，依欄位總數判斷新舊版位置，詳見
+    sync_daily._fetch_chips_tpex_legacy 的說明）。
+    """
     roc_year = target_date.year - 1911
     date_str = f"{roc_year}/{target_date.month:02d}/{target_date.day:02d}"
-    url = ("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_print.php"
-           f"?l=zh-tw&se=AL&t=D&d={date_str}&_=1")
+    url = (f"https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+           f"?date={date_str}&type=Daily&response=json")
     try:
         data = requests.get(url, timeout=15,
                             headers={"Referer": "https://www.tpex.org.tw/"}).json()
+        table = next((t for t in data.get("tables", []) if t.get("fields")), None)
+        if not table or not table.get("data"):
+            return {}
+
+        n_fields = len(table["fields"])
+        if n_fields == 16:
+            f_idx, i_idx, d_idx = 4, 7, 8
+        elif n_fields == 24:
+            f_idx, i_idx, d_idx = 4, 13, 22
+        else:
+            log.debug(f"TPEX {target_date}：未知欄位數 {n_fields}")
+            return {}
+
+        def p(s): return int(str(s).replace(",", "").replace("+", "").strip() or "0")
+
         result = {}
-        for row in data.get("aaData", []):
+        for row in table["data"]:
             code = f"{row[0].strip()}.TWO"
             if code not in WATCHLIST:
                 continue
-            def p(s): return int(str(s).replace(",", "").replace("+", "").strip() or "0")
             result[code] = {
-                "foreign_buy": p(row[4]),
-                "investment_buy": p(row[7]),
-                "dealer_buy": p(row[10]) if len(row) > 10 else 0,
+                "foreign_buy": p(row[f_idx]),
+                "investment_buy": p(row[i_idx]),
+                "dealer_buy": p(row[d_idx]),
             }
         return result
     except Exception as e:

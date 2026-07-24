@@ -43,7 +43,10 @@ def render():
 
     if st.button("載入當日選股清單", key="dd_load"):
         st.session_state["dd_strategy_date"] = str(practice_date)
-        st.cache_data.clear()  # 強制刷新（使用者手動刷日期時）
+        # 只清這個查詢自己的快取（強制重抓，避免同一天資料在3600秒TTL內被更新卻看不到）；
+        # 不用 st.cache_data.clear()——那會清空全站快取，連K線、公司行動紀錄等不相干的
+        # 查詢也一起砍掉，其他頁面下次還要重新打DB，沒必要。
+        db.fetch_strategy_by_date.clear()
 
     strategy_date = st.session_state.get("dd_strategy_date", str(practice_date))
 
@@ -70,7 +73,7 @@ def render():
     )
     view_code = selected_option.split(" ")[0]
 
-    # 撈取該股在基準日之前 180 天的 K 線（供技術分析判斷）
+    # 撈取該股在基準日之前 270 天的 K 線（供技術分析判斷）
     view_end = strategy_date
     view_start = str(date.fromisoformat(strategy_date) - timedelta(days=270))
     kline_df = db.fetch_kline_range(view_code, view_start, view_end)
