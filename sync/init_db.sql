@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS daily_strategy_results (
     target_price_2   DECIMAL(10, 2) DEFAULT NULL COMMENT '第二停利目標價',
     backtest_win_rate   DECIMAL(5, 2) DEFAULT NULL COMMENT '策略3Y歷史回測勝率%',
     backtest_total_pnl  DECIMAL(7, 2) DEFAULT NULL COMMENT '策略3Y回測總報酬%',
+    fwd_return_5d_win_rate  DECIMAL(5, 2) DEFAULT NULL COMMENT 'CHOSE進場後第5個交易日仍為正報酬的歷史機率%（樣本不足時為NULL）',
+    fwd_return_10d_win_rate DECIMAL(5, 2) DEFAULT NULL COMMENT 'CHOSE進場後第10個交易日仍為正報酬的歷史機率%（樣本不足時為NULL）',
+    fwd_return_20d_win_rate DECIMAL(5, 2) DEFAULT NULL COMMENT 'CHOSE進場後第20個交易日仍為正報酬的歷史機率%（樣本不足時為NULL）',
+    fwd_return_5d_n  INT DEFAULT NULL COMMENT '5日統計的樣本數（歷史進場次數，扣除資料不足N天的進場點）',
+    fwd_return_10d_n INT DEFAULT NULL COMMENT '10日統計的樣本數',
+    fwd_return_20d_n INT DEFAULT NULL COMMENT '20日統計的樣本數',
     PRIMARY KEY (id),
     UNIQUE KEY uq_date_code (trade_date, stock_code),
     KEY idx_date_modules (trade_date, is_chose_trigger, is_drive_trigger),
@@ -128,4 +134,21 @@ CREATE TABLE IF NOT EXISTS stock_character_notes (
     PRIMARY KEY (note_id),
     KEY idx_note_stock (stock_code),
     KEY idx_note_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ==========================================
+-- TABLE 6: 個股公司行動調整係數表
+-- 用途：減資/分割/合併等會讓 stock_daily_data 出現價格斷層的事件，在此登記調整係數。
+-- 非破壞性設計：stock_daily_data 原始資料永遠不動，調整只在讀取分析（_load_bars）當下套用。
+-- 沒有可靠的官方 API 能自動回溯偵測這類事件，因此採「異常偵測 log + 人工確認寫入」流程
+-- （見 sync/market_sync.py 的 _detect_price_anomalies）。
+-- ==========================================
+CREATE TABLE IF NOT EXISTS stock_corp_actions (
+    stock_code    VARCHAR(10)    NOT NULL COMMENT '股票代碼',
+    ex_date       DATE           NOT NULL COMMENT '生效日（復牌/分割生效當天，調整套用於此日之前的資料）',
+    adjust_factor DECIMAL(12, 6) NOT NULL COMMENT '調整係數 = 生效日收盤 / 生效日前一交易日收盤，套用於價格；量能則除以此係數',
+    action_type   VARCHAR(20)    DEFAULT NULL COMMENT '公司行動類型：減資 / 分割 / 合併，僅供備註',
+    note          VARCHAR(255)   DEFAULT NULL COMMENT '備註，如資料來源、人工確認方式',
+    created_at    TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (stock_code, ex_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

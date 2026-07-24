@@ -1,0 +1,10 @@
+# 連線密鑰，絕對不要提交（含 TiDB 帳密）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 編輯器/系統
+.DS_Store

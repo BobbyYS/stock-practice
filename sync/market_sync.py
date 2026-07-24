@@ -145,38 +145,59 @@ def fetch_market_day(d: date) -> dict[str, dict]:
 # 寫入
 # ------------------------------------------------------------------
 
+_UPSERT_CHUNK = 300   # 每次 INSERT 包多少列：把「每檔股票一次連線」降成每幾百檔一次
+
+
+def _chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def _upsert_info(data: dict[str, dict]):
-    for code, row in data.items():
-        market = "上櫃" if code.endswith(".TWO") else "上市"
-        db.execute(
-            """
-            INSERT INTO stock_info (stock_code, stock_name, market_type)
-            VALUES (:code, :name, :market)
-            ON DUPLICATE KEY UPDATE stock_name = VALUES(stock_name)
-            """,
-            {"code": code, "name": row["name"] or code, "market": market},
+    items = list(data.items())
+    for chunk in _chunked(items, _UPSERT_CHUNK):
+        values_sql, params = [], {}
+        for j, (code, row) in enumerate(chunk):
+            market = "上櫃" if code.endswith(".TWO") else "上市"
+            values_sql.append(f"(:code{j}, :name{j}, :market{j})")
+            params[f"code{j}"] = code
+            params[f"name{j}"] = row["name"] or code
+            params[f"market{j}"] = market
+        sql = (
+            "INSERT INTO stock_info (stock_code, stock_name, market_type) "
+            f"VALUES {', '.join(values_sql)} "
+            "ON DUPLICATE KEY UPDATE stock_name = VALUES(stock_name)"
         )
+        db.execute(sql, params)
 
 
 def _upsert_ohlcv(d: date, data: dict[str, dict]):
-    """只更新 OHLCV/volume；ON DUPLICATE 不動三大法人欄位（避免覆寫成 0）。"""
-    for code, row in data.items():
-        db.execute(
-            """
-            INSERT INTO stock_daily_data
-                (stock_code, trade_date, open_price, high_price, low_price,
-                 close_price, volume, foreign_buy, investment_buy, dealer_buy)
-            VALUES (:code, :dt, :op, :hp, :lp, :cp, :vol, 0, 0, 0)
-            ON DUPLICATE KEY UPDATE
-                open_price  = VALUES(open_price),
-                high_price  = VALUES(high_price),
-                low_price   = VALUES(low_price),
-                close_price = VALUES(close_price),
-                volume      = VALUES(volume)
-            """,
-            {"code": code, "dt": str(d), "op": row["open"], "hp": row["high"],
-             "lp": row["low"], "cp": row["close"], "vol": row["volume"]},
+    """只更新 OHLCV/volume；ON DUPLICATE 不動三大法人欄位（避免覆寫成 0）。
+    批次組成單一多列 INSERT，把每檔股票各一次連線降成每 _UPSERT_CHUNK 檔一次，
+    大幅減少對 TiDB Cloud 的網路往返次數（原本逐列寫入單一天要花數分鐘以上）。"""
+    items = list(data.items())
+    for chunk in _chunked(items, _UPSERT_CHUNK):
+        values_sql, params = [], {}
+        for j, (code, row) in enumerate(chunk):
+            values_sql.append(f"(:code{j}, :dt{j}, :op{j}, :hp{j}, :lp{j}, :cp{j}, :vol{j}, 0, 0, 0)")
+            params[f"code{j}"] = code
+            params[f"dt{j}"] = str(d)
+            params[f"op{j}"] = row["open"]
+            params[f"hp{j}"] = row["high"]
+            params[f"lp{j}"] = row["low"]
+            params[f"cp{j}"] = row["close"]
+            params[f"vol{j}"] = row["volume"]
+        sql = (
+            "INSERT INTO stock_daily_data "
+            "(stock_code, trade_date, open_price, high_price, low_price, "
+            " close_price, volume, foreign_buy, investment_buy, dealer_buy) "
+            f"VALUES {', '.join(values_sql)} "
+            "ON DUPLICATE KEY UPDATE "
+            "open_price = VALUES(open_price), high_price = VALUES(high_price), "
+            "low_price = VALUES(low_price), close_price = VALUES(close_price), "
+            "volume = VALUES(volume)"
         )
+        db.execute(sql, params)
 
 
 def sync_day(d: date) -> int:
@@ -186,7 +207,58 @@ def sync_day(d: date) -> int:
         return 0
     _upsert_info(data)
     _upsert_ohlcv(d, data)
+    _detect_price_anomalies(d)
     return len(data)
+
+
+# ------------------------------------------------------------------
+# 公司行動（減資/分割/合併）異常偵測：只記錄警告，不自動修改資料
+#
+# 沒有可靠的官方 API 能回溯查詢任意歷史日期的減資/分割事件（已實測 TWSE
+# 除權除息表、減資恢復買賣參考價兩支 API，前者不涵蓋減資、後者不支援指定
+# 歷史日期查詢），因此改用「單日價格斷層偵測 + 人工確認寫入 stock_corp_actions」
+# 的半自動流程：偵測到就記 log，人工確認屬實後手動補一筆調整係數。
+# ------------------------------------------------------------------
+
+ANOMALY_PCT_THRESHOLD = 0.30   # 單日收盤變動 >= 30% 視為疑似公司行動
+
+
+def _detect_price_anomalies(d: date):
+    """比對 d 這天所有股票的收盤價，與其「前一個既有交易日」（可能因停牌隔了好幾週）收盤價，
+    抓出疑似減資/分割/合併造成的價格斷層。"""
+    window_start = d - timedelta(days=120)   # 涵蓋常見的減資/分割停牌期（通常數週）
+    df = db.query_df(
+        """
+        SELECT stock_code, trade_date, close_price, prev_close, prev_date FROM (
+            SELECT stock_code, trade_date, close_price,
+                   LAG(close_price) OVER (PARTITION BY stock_code ORDER BY trade_date) AS prev_close,
+                   LAG(trade_date) OVER (PARTITION BY stock_code ORDER BY trade_date) AS prev_date
+            FROM stock_daily_data
+            WHERE trade_date BETWEEN :start AND :d
+        ) t
+        WHERE trade_date = :d AND prev_close IS NOT NULL
+        """,
+        {"start": str(window_start), "d": str(d)},
+    )
+    if df.empty:
+        return
+
+    close = df["close_price"].astype(float)
+    prev = df["prev_close"].astype(float)
+    pct_chg = (close - prev) / prev
+    flagged = df[pct_chg.abs() >= ANOMALY_PCT_THRESHOLD].copy()
+    if flagged.empty:
+        return
+
+    for _, row in flagged.iterrows():
+        c, p = float(row["close_price"]), float(row["prev_close"])
+        factor = c / p
+        log.warning(
+            f"⚠️ 疑似公司行動（減資/分割/合併）：{row['stock_code']} "
+            f"{row['prev_date']} 收盤 {p} -> {row['trade_date']} 收盤 {c} "
+            f"（變動 {(c-p)/p*100:+.1f}%，估計調整係數 {factor:.6f}）。"
+            f"若確認屬實，請手動寫入 stock_corp_actions（ex_date={row['trade_date']}, adjust_factor={factor:.6f}）。"
+        )
 
 
 # ------------------------------------------------------------------

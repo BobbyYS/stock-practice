@@ -409,6 +409,26 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
         log.warning(f"TWSE 三大法人 API 無資料 ({target_date})")
         return {}
 
+    # 欄位位置曾經改版（舊版16欄「外資買賣超股數」單一欄；新版19欄拆成
+    # 「外陸資買賣超股數(不含外資自營商)」+「外資自營商買賣超股數」兩欄需相加）。
+    # 依欄位「名稱」動態比對，不寫死位置，兩種格式都能正確解析。
+    fields = data.get("fields") or []
+
+    def parse_int(s: str) -> int:
+        return int(str(s).replace(",", "").replace("+", "") or "0")
+
+    foreign_idxs = [
+        i for i, f in enumerate(fields)
+        if "買賣超股數" in f and "外" in f and f != "自營商買賣超股數"
+        and "自行買賣" not in f and "避險" not in f
+    ]
+    invest_idx = fields.index("投信買賣超股數") if "投信買賣超股數" in fields else None
+    dealer_idx = fields.index("自營商買賣超股數") if "自營商買賣超股數" in fields else None
+
+    if not foreign_idxs or invest_idx is None or dealer_idx is None:
+        log.warning(f"TWSE 三大法人欄位比對失敗 ({target_date})：fields={fields}")
+        return {}
+
     result: dict[str, dict] = {}
     for row in data["data"]:
         code_raw = row[0].strip()
@@ -417,15 +437,9 @@ def _fetch_chips_twse(target_date: date) -> dict[str, dict]:
         if code not in WATCHLIST:
             continue
         try:
-            # 欄位：[0]代號 [1]名稱 [2]外資買 [3]外資賣 [4]外資淨
-            # [5]投信買 [6]投信賣 [7]投信淨 [8]自營商(自) [9] ... [13]自營商合計淨
-            def parse_int(s: str) -> int:
-                return int(s.replace(",", "").replace("+", ""))
-
-            foreign_net = parse_int(row[4])
-            invest_net = parse_int(row[7])
-            # 自營商合計淨（含避險）= index 13
-            dealer_net = parse_int(row[13]) if len(row) > 13 else parse_int(row[10])
+            foreign_net = sum(parse_int(row[i]) for i in foreign_idxs)
+            invest_net = parse_int(row[invest_idx])
+            dealer_net = parse_int(row[dealer_idx])
 
             result[code] = {
                 "foreign_buy": foreign_net,
@@ -496,16 +510,25 @@ def _fetch_chips_tpex_openapi(target_date: date) -> dict[str, dict]:
 
 
 def _fetch_chips_tpex_legacy(target_date: date) -> dict[str, dict]:
-    """TPEX 舊版 Web API — 支援歷史日期，用於 backfill。"""
-    import urllib3, time as _time
+    """
+    TPEX 歷史三大法人 API，用於 backfill。
+
+    注意：舊版 3itrade_print.php 端點已於 TPEX 網站改版後失效（回傳 302 導向
+    /errors）。改用新版 insti/dailyTrade 端點。此端點欄位無具名分組（皆為
+    「買進股數/賣出股數/買賣超股數」重複標籤），只能依「欄位總數」判斷新舊
+    版本區塊位置：
+      - 16 欄（5大類）：舊版，foreign=idx4, invest=idx7, dealer=idx8
+      - 24 欄（7大類）：新版，foreign=idx4, invest=idx13, dealer=idx22
+    以上位置皆已用 TPEX OpenAPI（有具名欄位，但只回最新一日）交叉比對驗證正確。
+    """
+    import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     roc_year = target_date.year - 1911
     date_str = f"{roc_year}/{target_date.month:02d}/{target_date.day:02d}"
-    ts = int(_time.time() * 1000)
     url = (
-        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_print.php"
-        f"?l=zh-tw&se=AL&t=D&d={date_str}&_={ts}"
+        "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+        f"?date={date_str}&type=Daily&response=json"
     )
     try:
         resp = _api_get(url, verify=False)
@@ -517,9 +540,22 @@ def _fetch_chips_tpex_legacy(target_date: date) -> dict[str, dict]:
         log.warning(f"TPEX 三大法人 API 失敗 ({target_date})：{e}")
         return {}
 
-    rows = data.get("aaData", [])
+    table = next((t for t in data.get("tables", []) if t.get("fields")), None)
+    if not table or not table.get("data"):
+        log.debug(f"TPEX {target_date}：無資料（可能假日或停市）")
+        return {}
+
+    n_fields = len(table["fields"])
+    if n_fields == 16:
+        f_idx, i_idx, d_idx = 4, 7, 8
+    elif n_fields == 24:
+        f_idx, i_idx, d_idx = 4, 13, 22
+    else:
+        log.warning(f"TPEX {target_date}：未知欄位數 {n_fields}，略過")
+        return {}
+
     result: dict[str, dict] = {}
-    for row in rows:
+    for row in table["data"]:
         code = f"{row[0].strip()}.TWO"
         if code not in WATCHLIST:
             continue
@@ -527,9 +563,9 @@ def _fetch_chips_tpex_legacy(target_date: date) -> dict[str, dict]:
             def p(s) -> int:
                 return int(str(s).replace(",", "").replace("+", "").strip() or "0")
             result[code] = {
-                "foreign_buy":    p(row[4]),
-                "investment_buy": p(row[7]),
-                "dealer_buy":     p(row[10]) if len(row) > 10 else 0,
+                "foreign_buy":    p(row[f_idx]),
+                "investment_buy": p(row[i_idx]),
+                "dealer_buy":     p(row[d_idx]),
             }
         except (ValueError, IndexError) as e:
             log.debug(f"解析 TPEX {code} 失敗：{e}")
