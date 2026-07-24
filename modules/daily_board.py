@@ -25,17 +25,24 @@ def _fmt_rs(val) -> str:
 
 
 def _fmt_forward_returns(row: pd.Series) -> str | None:
-    """組合「進場後 N 日仍為正報酬」機率文字，附樣本數避免小樣本數字誤導使用者。
-    三個窗口都沒有可用樣本時回傳 None（不顯示這行）。"""
+    """組合「進場後 N 日仍為正報酬」機率文字，格式如「5日66.7%(2/3)」——直接顯示
+    上漲次數/樣本數的分數，比只寫樣本數更直觀，避免小樣本數字誤導使用者。
+    三個窗口都沒有可用樣本時回傳 None（不顯示這行）。
+
+    資料庫只存了百分比(rate)跟樣本數(n)，沒有另外存上漲次數——用 round(rate/100*n)
+    反推即可，已經過窮舉驗證（n=1~200 全部組合）反推絕對精確，不需要為了這個顯示
+    格式多加欄位、多跑一次回補。"""
     parts = []
     for n in (5, 10, 20):
         rate = row.get(f"fwd_return_{n}d_win_rate")
         cnt = row.get(f"fwd_return_{n}d_n")
         if pd.notna(rate) and pd.notna(cnt):
-            parts.append(f"{n}日後{rate:.0f}%（{int(cnt)}次）")
+            total = int(cnt)
+            ups = round(float(rate) / 100 * total)
+            parts.append(f"{n}日{rate:.1f}%({ups}/{total})")
     if not parts:
         return None
-    return "📈 進場後上漲機率：" + "　".join(parts)
+    return "📈 進場後上漲機率：" + "、".join(parts)
 
 
 # ------------------------------------------------------------------
@@ -74,12 +81,17 @@ def render():
     st.caption(f"資料日期：{queried_date}｜黃金交集 {len(gold)} 檔 ／ 型態突破 {len(chose_only)} 檔 ／ 大戶潛伏 {len(drive_only)} 檔")
 
     corp_actions = db.fetch_corp_actions()
+    # 公司行動分頁只顯示「這次選股結果裡有出現」的股票，不是全部登記過的60檔——
+    # 全部列出對使用者沒有意義，這裡只是想讓人知道「今天看到的這些訊號裡，哪些
+    # 已經被減資/分割調整過」。徽章查核（_corp_action_badge）仍用完整的 corp_actions，
+    # 邏輯不受影響，只有這個分頁的顯示範圍縮小。
+    board_corp_actions = corp_actions[corp_actions["stock_code"].isin(df["stock_code"])]
 
     tab1, tab2, tab3, tab4 = st.tabs([
         f"🔥 黃金交集區 ({len(gold)})",
         f"📈 動態突破區 ({len(chose_only)})",
         f"👑 大戶潛伏區 ({len(drive_only)})",
-        f"🔧 公司行動紀錄 ({len(corp_actions)})",
+        f"🔧 公司行動紀錄 ({len(board_corp_actions)})",
     ])
 
     with tab1:
@@ -92,7 +104,7 @@ def render():
         _render_drive_tab(drive_only, queried_date, corp_actions)
 
     with tab4:
-        _render_corp_actions_tab(corp_actions)
+        _render_corp_actions_tab(board_corp_actions)
 
 
 # ------------------------------------------------------------------
@@ -265,15 +277,17 @@ def _render_drive_tab(df: pd.DataFrame, date_str: str, corp_actions: pd.DataFram
 
 
 def _render_corp_actions_tab(corp_actions: pd.DataFrame):
-    """列出所有已確認的減資/分割/合併調整紀錄，供使用者查核選股雷達的技術指標
-    是否受過公司行動影響（見 build_strategy.py 的 stock_corp_actions 調整機制）。"""
+    """列出『這次選股結果裡有出現』的股票中，哪些發生過減資/分割/合併調整
+    （見 build_strategy.py 的 stock_corp_actions 調整機制）。只顯示跟今天畫面上
+    三個分頁相關的股票，不是資料庫裡登記過的全部公司行動紀錄。"""
     st.caption(
-        "以下股票在標記日期發生過減資／分割／合併，官方原始股價資料在該日前後會出現"
-        "斷層。選股雷達已自動用調整係數校正 MA／RS強度／回測，讓計算看到連續價格；"
-        "「調整係數」= 生效日收盤 ÷ 生效日前一交易日收盤（分割/增股 >1，減資/縮股 <1）。"
+        "以下是本次選股結果中，曾發生減資／分割／合併的股票。官方原始股價資料在"
+        "生效日前後會出現斷層，選股雷達已自動用調整係數校正 MA／RS強度／回測，讓"
+        "計算看到連續價格；「調整係數」= 生效日收盤 ÷ 生效日前一交易日收盤"
+        "（分割/增股 >1，減資/縮股 <1）。"
     )
     if corp_actions.empty:
-        st.info("目前尚無已登記的公司行動紀錄。")
+        st.info("本次選股結果中沒有股票受過公司行動影響。")
         return
 
     show_df = corp_actions.rename(columns={
