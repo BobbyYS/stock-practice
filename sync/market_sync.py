@@ -44,7 +44,13 @@ HEADERS = {
 }
 API_DELAY = 1.0
 _CODE_RE = re.compile(r"^\d{4}$")          # 僅 4 位數字代號
-COMPLETE_THRESHOLD = 500                    # 單日 >= 此股票數視為「全市場已存在」
+# 分開設上市/上櫃各自的門檻（而不是用合併總數判斷）：TWSE 上市本身就有 1000+ 檔，
+# 若只用「合併總數 >= 500」判斷完整性，會發生「上市抓到、上櫃整個抓失敗」時，
+# 合併總數依然輕鬆超過 500，被誤判成「這天已經是全市場資料」，之後 ensure_history()
+# 就永遠不會重試那一天，上櫃資料就永久性地少了一半市場。
+# 2026-08-07 就是實際踩到的案例：上市 1089 檔、上櫃 0 檔，合併 1089 >= 500 被判定完整。
+COMPLETE_THRESHOLD_TW = 500                 # 上市單日 >= 此股票數視為「已完整抓取」
+COMPLETE_THRESHOLD_TWO = 300                 # 上櫃單日 >= 此股票數視為「已完整抓取」
 
 
 def _num(s):
@@ -69,16 +75,34 @@ def _pick_table(tables: list, must_have: list[str]):
 # 單日全市場抓取
 # ------------------------------------------------------------------
 
+RETRY_ATTEMPTS = 3   # 單一交易所端點的重試次數（含第一次嘗試）
+RETRY_BACKOFF = 3.0  # 每次重試間隔秒數
+
+
+def _get_json_with_retry(url: str, *, label: str, timeout: int, verify: bool = True, **params) -> dict | None:
+    """呼叫端點並解析 JSON，失敗（連線/逾時/非 JSON）時重試數次再放棄。
+    只有連續 RETRY_ATTEMPTS 次都失敗才回傳 None——避免單次網路抖動就整天漏抓一個交易所。"""
+    last_err: Exception | None = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, verify=verify)
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < RETRY_ATTEMPTS:
+                log.warning(f"{label} 第 {attempt}/{RETRY_ATTEMPTS} 次嘗試失敗，{RETRY_BACKOFF:.0f}s 後重試：{e}")
+                time.sleep(RETRY_BACKOFF)
+    log.warning(f"{label} 重試 {RETRY_ATTEMPTS} 次後仍失敗，放棄：{last_err}")
+    return None
+
+
 def fetch_twse_day(d: date) -> dict[str, dict]:
     """上市單日全市場。回傳 {code.TW: {open,high,low,close,volume,name}}。"""
-    params = {"date": d.strftime("%Y%m%d"), "type": "ALLBUT0999", "response": "json"}
-    try:
-        r = requests.get(TWSE_URL, params=params, headers=HEADERS, timeout=20)
-        j = r.json()
-    except Exception as e:
-        log.warning(f"TWSE MI_INDEX {d} 失敗：{e}")
-        return {}
-    if j.get("stat") != "OK":
+    j = _get_json_with_retry(
+        TWSE_URL, label=f"TWSE MI_INDEX {d}", timeout=20,
+        date=d.strftime("%Y%m%d"), type="ALLBUT0999", response="json",
+    )
+    if j is None or j.get("stat") != "OK":
         return {}
     table = _pick_table(j.get("tables") or [], ["證券代號", "收盤價"])
     if not table:
@@ -103,12 +127,11 @@ def fetch_twse_day(d: date) -> dict[str, dict]:
 def fetch_tpex_day(d: date) -> dict[str, dict]:
     """上櫃單日全市場。回傳 {code.TWO: {...}}。"""
     roc = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
-    params = {"date": roc, "type": "EW", "response": "json"}
-    try:
-        r = requests.get(TPEX_URL, params=params, headers=HEADERS, timeout=25, verify=False)
-        j = r.json()
-    except Exception as e:
-        log.warning(f"TPEX dailyQuotes {d} 失敗：{e}")
+    j = _get_json_with_retry(
+        TPEX_URL, label=f"TPEX dailyQuotes {d}", timeout=25, verify=False,
+        date=roc, type="EW", response="json",
+    )
+    if j is None:
         return {}
     table = _pick_table(j.get("tables") or [], ["代號", "收盤"])
     if not table:
@@ -205,6 +228,12 @@ def sync_day(d: date) -> int:
     data = fetch_market_day(d)
     if not data:
         return 0
+    n_tw = sum(1 for c in data if c.endswith(".TW"))
+    n_two = sum(1 for c in data if c.endswith(".TWO"))
+    if n_tw < COMPLETE_THRESHOLD_TW:
+        log.warning(f"⚠️ {d} 上市(TWSE)只抓到 {n_tw} 檔，疑似該交易所端點失敗或資料不完整")
+    if n_two < COMPLETE_THRESHOLD_TWO:
+        log.warning(f"⚠️ {d} 上櫃(TPEX)只抓到 {n_two} 檔，疑似該交易所端點失敗或資料不完整")
     _upsert_info(data)
     _upsert_ohlcv(d, data)
     _detect_price_anomalies(d)
@@ -266,13 +295,16 @@ def _detect_price_anomalies(d: date):
 # ------------------------------------------------------------------
 
 def _complete_dates() -> set:
-    """已具備『全市場』資料的交易日集合（單日股票數 >= 門檻）。"""
+    """已具備『全市場』資料的交易日集合：上市、上櫃各自的股票數都要達到門檻，
+    避免其中一個交易所抓失敗時，被另一邊撐大的合併總數誤判成「已完整」。"""
     df = db.query_df(
         """
         SELECT trade_date FROM stock_daily_data
-        GROUP BY trade_date HAVING COUNT(*) >= :thr
+        GROUP BY trade_date
+        HAVING SUM(CASE WHEN stock_code LIKE '%.TW' THEN 1 ELSE 0 END) >= :thr_tw
+           AND SUM(CASE WHEN stock_code LIKE '%.TWO' THEN 1 ELSE 0 END) >= :thr_two
         """,
-        {"thr": COMPLETE_THRESHOLD},
+        {"thr_tw": COMPLETE_THRESHOLD_TW, "thr_two": COMPLETE_THRESHOLD_TWO},
     )
     out = set()
     for v in df["trade_date"].tolist():
