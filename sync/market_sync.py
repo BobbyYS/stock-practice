@@ -75,16 +75,34 @@ def _pick_table(tables: list, must_have: list[str]):
 # 單日全市場抓取
 # ------------------------------------------------------------------
 
+RETRY_ATTEMPTS = 3   # 單一交易所端點的重試次數（含第一次嘗試）
+RETRY_BACKOFF = 3.0  # 每次重試間隔秒數
+
+
+def _get_json_with_retry(url: str, *, label: str, timeout: int, verify: bool = True, **params) -> dict | None:
+    """呼叫端點並解析 JSON，失敗（連線/逾時/非 JSON）時重試數次再放棄。
+    只有連續 RETRY_ATTEMPTS 次都失敗才回傳 None——避免單次網路抖動就整天漏抓一個交易所。"""
+    last_err: Exception | None = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, verify=verify)
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < RETRY_ATTEMPTS:
+                log.warning(f"{label} 第 {attempt}/{RETRY_ATTEMPTS} 次嘗試失敗，{RETRY_BACKOFF:.0f}s 後重試：{e}")
+                time.sleep(RETRY_BACKOFF)
+    log.warning(f"{label} 重試 {RETRY_ATTEMPTS} 次後仍失敗，放棄：{last_err}")
+    return None
+
+
 def fetch_twse_day(d: date) -> dict[str, dict]:
     """上市單日全市場。回傳 {code.TW: {open,high,low,close,volume,name}}。"""
-    params = {"date": d.strftime("%Y%m%d"), "type": "ALLBUT0999", "response": "json"}
-    try:
-        r = requests.get(TWSE_URL, params=params, headers=HEADERS, timeout=20)
-        j = r.json()
-    except Exception as e:
-        log.warning(f"TWSE MI_INDEX {d} 失敗：{e}")
-        return {}
-    if j.get("stat") != "OK":
+    j = _get_json_with_retry(
+        TWSE_URL, label=f"TWSE MI_INDEX {d}", timeout=20,
+        date=d.strftime("%Y%m%d"), type="ALLBUT0999", response="json",
+    )
+    if j is None or j.get("stat") != "OK":
         return {}
     table = _pick_table(j.get("tables") or [], ["證券代號", "收盤價"])
     if not table:
@@ -109,12 +127,11 @@ def fetch_twse_day(d: date) -> dict[str, dict]:
 def fetch_tpex_day(d: date) -> dict[str, dict]:
     """上櫃單日全市場。回傳 {code.TWO: {...}}。"""
     roc = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
-    params = {"date": roc, "type": "EW", "response": "json"}
-    try:
-        r = requests.get(TPEX_URL, params=params, headers=HEADERS, timeout=25, verify=False)
-        j = r.json()
-    except Exception as e:
-        log.warning(f"TPEX dailyQuotes {d} 失敗：{e}")
+    j = _get_json_with_retry(
+        TPEX_URL, label=f"TPEX dailyQuotes {d}", timeout=25, verify=False,
+        date=roc, type="EW", response="json",
+    )
+    if j is None:
         return {}
     table = _pick_table(j.get("tables") or [], ["代號", "收盤"])
     if not table:
