@@ -148,37 +148,57 @@ def _benchmark(bars: Bars | None):
 
 # ------------------------------------------------------------------
 # CHOSE：買入型態判斷（移植，移除 price>20）
+#
+# _chose_rolling / _chose_signal_at 是「今日掃描」與「3Y 回測」共用的唯一一份判斷邏輯。
+# 舊版本 backtest_3y() 曾經自己另外重寫一次同樣的型態判斷（窗口用 h.iloc[i-N:i]），
+# 跟這裡的寫法在 year_high／prev_20_high／rally 三個窗口上都有一天的落差（是否把
+# 「當天」自己算進窗口、20 天 vs 21 天），導致「今天有沒有觸發 CHOSE」跟「3Y 回測
+# 認定的歷史進場點」可能對不上（同一天，兩套規則各自判斷出不同結果）。
+# 統一抽成這兩個函式後，兩邊永遠吃同一份視窗定義，不會再各自實作出現落差。
 # ------------------------------------------------------------------
 
-def analyze_chose(bars: Bars, bench_roc: float) -> dict | None:
-    if len(bars) < MIN_ROWS_SCAN:
-        return None
-    close, high, vol, open_p = bars.close, bars.high, bars.vol, bars.open
+def _chose_rolling(bars: Bars) -> dict[str, pd.Series]:
+    """預先計算 CHOSE 判斷所需的滾動指標，索引與 bars 對齊。
+    年高點／噴出幅度視窗包含當天；前 20 日高點視窗不含當天（shift(1) 往前 20 天）。"""
+    close, high, vol = bars.close, bars.high, bars.vol
+    return {
+        "avg_vol20": vol.rolling(20).mean(),
+        "ma50": close.rolling(50).mean(),
+        "ma200": close.rolling(200).mean(),
+        "year_high": high.rolling(250, min_periods=1).max(),
+        "prev_20_high": high.rolling(20, min_periods=1).max().shift(1),
+        "rally_high": high.rolling(60, min_periods=1).max(),
+        "rally_low": close.rolling(60, min_periods=1).min(),
+    }
 
-    curr = float(close.iloc[-1])
-    avg_vol = float(vol.rolling(20).mean().iloc[-1])
-    if avg_vol < MIN_VOLUME_CHOSE:        # 移除了 curr < min_price 的股價門檻
+
+def _chose_signal_at(bars: Bars, roll: dict[str, pd.Series], i: int, bench_roc: float) -> dict | None:
+    """判斷索引 i（視為「當天」）是否符合 CHOSE 進場型態。"""
+    close, open_p = bars.close, bars.open
+    curr = float(close.iloc[i])
+
+    if roll["avg_vol20"].iloc[i] < MIN_VOLUME_CHOSE:   # 移除了 curr < min_price 的股價門檻
         return None
 
-    ma50 = float(close.rolling(50).mean().iloc[-1])
-    ma200 = float(close.rolling(200).mean().iloc[-1])
+    ma50 = float(roll["ma50"].iloc[i])
+    ma200 = float(roll["ma200"].iloc[i])
     if not (curr > ma50 > ma200):
         return None
 
-    stock_roc = float(close.pct_change(RS_PERIOD_CHOSE).iloc[-1])
+    stock_roc = float(close.iloc[i] / close.iloc[i - RS_PERIOD_CHOSE] - 1)
     rs_rating = (stock_roc - bench_roc) * 100
     if rs_rating < 0:
         return None
 
-    year_high = float(high.iloc[-250:].max())
-    prev_20_high = float(high.iloc[-21:-1].max())
-    is_breakout = (curr > prev_20_high) and (float(close.iloc[-2]) < prev_20_high)
+    year_high = float(roll["year_high"].iloc[i])
+    prev_20_high = float(roll["prev_20_high"].iloc[i])
+    is_breakout = (curr > prev_20_high) and (float(close.iloc[i - 1]) < prev_20_high)
 
-    rally = (high.iloc[-60:].max() - close.iloc[-60:].min()) / close.iloc[-60:].min()
+    rally = (float(roll["rally_high"].iloc[i]) - float(roll["rally_low"].iloc[i])) / float(roll["rally_low"].iloc[i])
     setup, reason = "", ""
     if rally > 0.8 and (year_high - curr) / year_high < 0.25 and is_breakout:
         setup, reason = "🚀 高窄旗型", "飆漲動能突破"
-    elif (float(open_p.iloc[-1]) - float(close.iloc[-2])) / float(close.iloc[-2]) > 0.08:
+    elif (float(open_p.iloc[i]) - float(close.iloc[i - 1])) / float(close.iloc[i - 1]) > 0.08:
         setup, reason = "🕳️ 買進跳空", "強力消息缺口"
     elif is_breakout and (year_high - curr) / year_high < 0.15:
         setup, reason = "📦 VCP突破", "整理區帶量突破"
@@ -191,6 +211,13 @@ def analyze_chose(bars: Bars, bench_roc: float) -> dict | None:
         "rs_rating": round(rs_rating, 1),
         "suggested_entry": round(prev_20_high, 2),
     }
+
+
+def analyze_chose(bars: Bars, bench_roc: float) -> dict | None:
+    if len(bars) < MIN_ROWS_SCAN:
+        return None
+    roll = _chose_rolling(bars)
+    return _chose_signal_at(bars, roll, len(bars) - 1, bench_roc)
 
 
 # ------------------------------------------------------------------
@@ -271,12 +298,10 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> dict:
     """
     if len(bars) < MIN_ROWS_BACKTEST:
         return _empty_backtest_result()
-    c = bars.close; h = bars.high; o = bars.open; v = bars.vol
+    c = bars.close
     ma10 = c.rolling(10).mean()
     ma20 = c.rolling(20).mean()
-    ma50 = c.rolling(50).mean()
-    ma200 = c.rolling(200).mean()
-    avg_vol_20 = v.rolling(20).mean()
+    roll = _chose_rolling(bars)
 
     trades: list[float] = []
     entry_indices: list[int] = []
@@ -289,22 +314,9 @@ def backtest_3y(bars: Bars, bench_roc_series: dict) -> dict:
         dt = bars.dates[i]
 
         if not in_pos:
-            # 進場：CHOSE 邏輯（移除 curr_c < 20；量改張）
-            if avg_vol_20.iloc[i] < MIN_VOLUME_CHOSE:
-                continue
-            if not (curr_c > ma50.iloc[i] > ma200.iloc[i]):
-                continue
-            s_roc = float(c.iloc[i] / c.iloc[i - RS_PERIOD_CHOSE] - 1)
-            if (s_roc - bench_roc_series.get(dt, 0)) < 0:
-                continue
-            y_high = float(h.iloc[i - 250:i].max())
-            p20_high = float(h.iloc[i - 21:i].max())
-            is_break = (curr_c > p20_high) and (float(c.iloc[i - 1]) < p20_high)
-            rally = (h.iloc[i - 60:i].max() - c.iloc[i - 60:i].min()) / c.iloc[i - 60:i].min()
-            is_flag = rally > 0.8 and (y_high - curr_c) / y_high < 0.25 and is_break
-            is_gap = (float(o.iloc[i]) - float(c.iloc[i - 1])) / float(c.iloc[i - 1]) > 0.08
-            is_vcp = is_break and (y_high - curr_c) / y_high < 0.15
-            if is_flag or is_gap or is_vcp:
+            # 進場：與 analyze_chose() 共用同一份 CHOSE 判斷（_chose_signal_at），
+            # 確保「今日掃描」跟「3Y 回測進場點」永遠是同一套規則。
+            if _chose_signal_at(bars, roll, i, bench_roc_series.get(dt, 0)) is not None:
                 entry_p = curr_c
                 in_pos = True
                 entry_indices.append(i)
